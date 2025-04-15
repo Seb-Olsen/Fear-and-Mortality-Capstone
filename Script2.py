@@ -122,7 +122,7 @@ memory = Memory(cache_dir, verbose=0)
 # Configuration
 # ---------------------
 ECCO_DIR = '/Users/sebo/Desktop/AUC/Semester 6/Capstone/Programming/ecco_all/p5/ecco_p5_released' # Adjust if needed
-COUNTS_FILE = 'WeeklyBillsMortality1644to1849/counts.txt' # Adjust if needed
+COUNTS_FILE = '/Users/sebo/Desktop/AUC/Semester 6/Capstone/Programming/WeeklyBillsMortality1644to1849/counts.txt' # Adjust if needed
 HISTORICAL_DICT_PATH = "historical_dict.txt" # for SymSpell
 START_YEAR = 1701
 END_YEAR = 1800
