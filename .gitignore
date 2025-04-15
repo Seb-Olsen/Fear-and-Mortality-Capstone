@@ -15,3 +15,46 @@ cache_dir_monthly_macberth_filtered/joblib/__main__--Users-sebo-Desktop-AUC-Seme
 .DS_Store
 cache_dir_monthly_macberth_filtered/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/parse_ecco_tei_files/0153a5b9143126191660243ca2785a99/output.pkl
 cache_dir_monthly_macberth_filtered/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/parse_ecco_tei_files/0153a5b9143126191660243ca2785a99/metadata.json
+lightning_logs/tft_fear_model/version_2/projector_config.pbtxt
+lightning_logs/tft_fear_model/version_2/hparams.yaml
+lightning_logs/tft_fear_model/version_2/events.out.tfevents.1744713310.MacBookPro.6101.0
+lightning_logs/tft_fear_model/version_2/checkpoints/epoch=30-step=1085.ckpt
+lightning_logs/tft_fear_model/version_2/01085/year/tensors.tsv
+lightning_logs/tft_fear_model/version_2/01085/year/metadata.tsv
+lightning_logs/tft_fear_model/version_2/01085/series_id/tensors.tsv
+lightning_logs/tft_fear_model/version_2/01085/series_id/metadata.tsv
+lightning_logs/tft_fear_model/version_2/01085/month/tensors.tsv
+lightning_logs/tft_fear_model/version_2/01085/month/metadata.tsv
+lightning_logs/tft_fear_model/version_1/projector_config.pbtxt
+lightning_logs/tft_fear_model/version_1/hparams.yaml
+lightning_logs/tft_fear_model/version_1/events.out.tfevents.1744713167.MacBookPro.5848.0
+lightning_logs/tft_fear_model/version_1/checkpoints/epoch=30-step=1085.ckpt
+lightning_logs/tft_fear_model/version_1/01085/year/tensors.tsv
+lightning_logs/tft_fear_model/version_1/01085/year/metadata.tsv
+lightning_logs/tft_fear_model/version_1/01085/series_id/tensors.tsv
+lightning_logs/tft_fear_model/version_1/01085/series_id/metadata.tsv
+lightning_logs/tft_fear_model/version_1/01085/month/tensors.tsv
+lightning_logs/tft_fear_model/version_1/01085/month/metadata.tsv
+lightning_logs/tft_fear_model/version_0/projector_config.pbtxt
+lightning_logs/tft_fear_model/version_0/hparams.yaml
+lightning_logs/tft_fear_model/version_0/events.out.tfevents.1744712827.MacBookPro.5224.0
+lightning_logs/tft_fear_model/version_0/checkpoints/epoch=29-step=1050.ckpt
+lightning_logs/tft_fear_model/version_0/01050/year/tensors.tsv
+lightning_logs/tft_fear_model/version_0/01050/year/metadata.tsv
+lightning_logs/tft_fear_model/version_0/01050/series_id/tensors.tsv
+lightning_logs/tft_fear_model/version_0/01050/series_id/metadata.tsv
+lightning_logs/tft_fear_model/version_0/01050/month/tensors.tsv
+lightning_logs/tft_fear_model/version_0/01050/month/metadata.tsv
+cache_dir_monthly_macberth_filtered/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/parse_ecco_tei_files/d30c4e65904cb0c0078ffc062deca152/output.pkl
+cache_dir_monthly_macberth_filtered/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/parse_ecco_tei_files/d30c4e65904cb0c0078ffc062deca152/metadata.json
+cache_dir_monthly_macberth_filtered/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/parse_ecco_tei_files/48af90dc973ea5c77eb141c4e4b3af3b/output.pkl
+cache_dir_monthly_macberth_filtered/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/parse_ecco_tei_files/48af90dc973ea5c77eb141c4e4b3af3b/metadata.json
+cache_dir_monthly_macberth_filtered/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/load_and_aggregate_monthly_mortality/fc2e81d133742b494fe0612064379c9e/output.pkl
+cache_dir_monthly_macberth_filtered/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/load_and_aggregate_monthly_mortality/fc2e81d133742b494fe0612064379c9e/metadata.json
+cache_dir_monthly_macberth_filtered/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/calculate_fear_scores_dataframe/c58fd555374a4e9299e787c7e9f918d1/output.pkl
+cache_dir_monthly_macberth_filtered/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/calculate_fear_scores_dataframe/c58fd555374a4e9299e787c7e9f918d1/metadata.json
+cache_dir_monthly_macberth_filtered/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/aggregate_yearly_sentiment_and_merge_monthly/func_code.py
+cache_dir_monthly_macberth_filtered/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/aggregate_yearly_sentiment_and_merge_monthly/c971222d64fc6a274c971697950cc8d1/output.pkl
+cache_dir_monthly_macberth_filtered/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/aggregate_yearly_sentiment_and_merge_monthly/c971222d64fc6a274c971697950cc8d1/metadata.json
+cache_dir_monthly_macberth_filtered/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/aggregate_yearly_sentiment_and_merge_monthly/2ed17b15a6e172b26fc9af059bd6f8f4/output.pkl
+cache_dir_monthly_macberth_filtered/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/aggregate_yearly_sentiment_and_merge_monthly/2ed17b15a6e172b26fc9af059bd6f8f4/metadata.json

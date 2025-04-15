@@ -700,76 +700,156 @@ def train_tft_model(df: pd.DataFrame,
         else: logger.warning("Best checkpoint not found/saved. Returning last model state."); last_model = trainer.model if hasattr(trainer, 'model') else tft; last_model.to(DEVICE); return last_model, trainer, val_dataloader, validation_dataset
     except Exception as e: logger.error(f"Error during TFT fitting: {e}", exc_info=True); return None, trainer, val_dataloader, validation_dataset
 
-# --- evaluate_model function (Corrected Signature) ---
+# --- evaluate_model function (better PLOTTING LOGIC) ---
 def evaluate_model(model: TemporalFusionTransformer, dataloader: torch.utils.data.DataLoader, dataset: TimeSeriesDataSet, plot_dir: str) -> Dict[str, float]:
-    """Evaluates TFT model, returns metrics, saves plots."""
+    """
+    Evaluates TFT model, returns metrics, saves plots for the AGGREGATED validation forecast.
+    """
     logger.info("Evaluating model performance on validation set...")
     results = {}
-    if model is None or dataloader is None or len(dataloader) == 0: logger.error("Model/Dataloader missing for eval."); return {"MAE": np.nan, "MSE": np.nan, "SMAPE": np.nan}
+    if model is None or dataloader is None or len(dataloader) == 0:
+        logger.error("Model/Dataloader missing for eval.")
+        return {"MAE": np.nan, "MSE": np.nan, "SMAPE": np.nan}
+
+    # Determine device
     try: eval_device = next(model.parameters()).device
     except Exception: eval_device = torch.device(DEVICE); model.to(eval_device)
     logger.info(f"Evaluation device: {eval_device}")
 
-    actuals_list, predictions_list = [], []
+    # --- Calculate Metrics First (using simpler loop) ---
+    actuals_metric_list, preds_metric_list = [], []
     with torch.no_grad():
-         for x, y in iter(dataloader):
-             x = {k: v.to(eval_device) for k, v in x.items() if isinstance(v, torch.Tensor)}; target = y[0].to(eval_device)
-             preds = model(x)["prediction"]; predictions_list.append(preds.cpu()); actuals_list.append(target.cpu())
-    if not predictions_list: logger.error("No predictions collected."); return {"MAE": np.nan, "MSE": np.nan, "SMAPE": np.nan}
+        for x, y in iter(dataloader):
+            x = {k: v.to(eval_device) for k, v in x.items() if isinstance(v, torch.Tensor)}
+            target = y[0].to(eval_device) # y = (target, weight)
+            preds = model(x)["prediction"] # Shape: (batch_size, pred_len, n_quantiles)
+            preds_metric_list.append(preds[:, :, 1].cpu()) # Use median for metrics
+            actuals_metric_list.append(target.cpu())
 
-    actuals_tensor = torch.cat(actuals_list, dim=0); predictions_tensor = torch.cat(predictions_list, dim=0)
-    preds_median_flat = predictions_tensor[:, :, 1].flatten().numpy(); actuals_flat = actuals_tensor.flatten().numpy()
-    min_len = min(len(actuals_flat), len(preds_median_flat))
-    if len(actuals_flat) != len(preds_median_flat): logger.warning(f"Eval length mismatch: {len(actuals_flat)} vs {len(preds_median_flat)}. Truncate."); preds_median_flat=preds_median_flat[:min_len]; actuals_flat=actuals_flat[:min_len]
-    preds_median_flat = np.maximum(0, preds_median_flat)
+    if not preds_metric_list:
+        logger.error("No predictions collected for metrics."); return {"MAE": np.nan, "MSE": np.nan, "SMAPE": np.nan}
 
-    val_mae = mean_absolute_error(actuals_flat, preds_median_flat); val_mse = mean_squared_error(actuals_flat, preds_median_flat)
-    denominator = (np.abs(actuals_flat) + np.abs(preds_median_flat)) / 2.0; val_smape = np.mean(np.abs(preds_median_flat - actuals_flat) / np.where(denominator == 0, 1, denominator)) * 100
+    # Flatten for metrics
+    actuals_flat_m = torch.cat(actuals_metric_list).flatten().numpy()
+    preds_median_flat_m = torch.cat(preds_metric_list).flatten().numpy()
+    min_len_m = min(len(actuals_flat_m), len(preds_median_flat_m))
+    if len(actuals_flat_m) != len(preds_median_flat_m): logger.warning(f"Metric length mismatch: {len(actuals_flat_m)} vs {len(preds_median_flat_m)}. Truncate."); preds_median_flat_m=preds_median_flat_m[:min_len_m]; actuals_flat_m=actuals_flat_m[:min_len_m]
+    preds_median_flat_m = np.maximum(0, preds_median_flat_m) # Clip predictions
+
+    val_mae = mean_absolute_error(actuals_flat_m, preds_median_flat_m)
+    val_mse = mean_squared_error(actuals_flat_m, preds_median_flat_m)
+    denominator = (np.abs(actuals_flat_m) + np.abs(preds_median_flat_m)) / 2.0
+    val_smape = np.mean(np.abs(preds_median_flat_m - actuals_flat_m) / np.where(denominator == 0, 1, denominator)) * 100
     results = {"MAE": val_mae, "MSE": val_mse, "SMAPE": val_smape}
     logger.info(f"[Validation Metrics] MAE={val_mae:.3f} MSE={val_mse:.3f} SMAPE={val_smape:.3f}%")
 
-    # --- Plotting ---
+    # --- Plotting Section (Using predict for aligned data) ---
+    logger.info("Generating evaluation plots...")
     try:
-        prediction_output = model.predict(dataloader, mode="raw", return_x=True, return_index=True)
+        # Use predict to get aligned outputs, inputs (x), and index
+        # This iterates through the dataloader internally
+        raw_predictions = model.predict(dataloader, mode="raw", return_x=True, return_index=True)
+        # raw_predictions is typically a list or tuple: [preds_dict, x_dict, index_df]
 
-        # Unpack assuming [predictions_dict, x_dict, index_df] structure
-        # Adjust indices if your version returns a different order or tuple
-        if isinstance(prediction_output, (list, tuple)) and len(prediction_output) == 3:
-            raw_preds_dict = prediction_output[0] # Dictionary containing predictions
-            x_dict = prediction_output[1]         # Dictionary containing input data
-            index_df = prediction_output[2]       # DataFrame containing index info
-        else:
-            # Fallback or handle other potential return types if needed
-            logger.error(f"Unexpected return type from model.predict: {type(prediction_output)}. Cannot unpack for plotting.")
-            # Return metrics only if plotting fails due to unexpected format
+        # --- Unpack Results ---
+        preds_dict = None; x_dict = None; index_df = None
+        if isinstance(raw_predictions, (list, tuple)):
+            if len(raw_predictions) > 0 and isinstance(raw_predictions[0], dict):
+                preds_dict = raw_predictions[0]
+            if len(raw_predictions) > 1 and isinstance(raw_predictions[1], dict):
+                x_dict = raw_predictions[1]
+            if len(raw_predictions) > 2 and isinstance(raw_predictions[2], pd.DataFrame):
+                index_df = raw_predictions[2]
+        elif isinstance(raw_predictions, dict): # Fallback if it returns a dict
+             preds_dict = raw_predictions
+
+        if preds_dict is None or 'prediction' not in preds_dict:
+            logger.error("Could not extract prediction dict from model.predict(). Skipping plots.")
+            return results # Return metrics calculated earlier
+        if x_dict is None or 'decoder_target' not in x_dict:
+            logger.error("Could not extract input dict 'x' with 'decoder_target' from model.predict(). Skipping plots.")
             return results
+        if index_df is None or 'time_idx' not in index_df.columns:
+             logger.error("Could not extract index dataframe with 'time_idx' from model.predict(). Skipping plots.")
+             return results
 
-        # Access predictions from the dictionary
-        p10_all = raw_preds_dict['prediction'][:, :, 0].flatten().cpu().numpy()
-        p50_all = raw_preds_dict['prediction'][:, :, 1].flatten().cpu().numpy()
-        p90_all = raw_preds_dict['prediction'][:, :, 2].flatten().cpu().numpy()
-        actuals_all_list = [y[0].cpu() for _, y in iter(dataloader)]; actuals_all = torch.cat(actuals_all_list).flatten().numpy()
-        min_len_final = min(len(p50_all), len(actuals_all)); p10_all=p10_all[:min_len_final]; p50_all=p50_all[:min_len_final]; p90_all=p90_all[:min_len_final]; actuals_all=actuals_all[:min_len_final]
-        time_idx = index_df["time_idx"].values[:min_len_final]
-        idx_order = np.argsort(time_idx); time_idx_sorted=time_idx[idx_order]; act_sorted=actuals_all[idx_order]; p10_sorted=p10_all[idx_order]; p50_sorted=p50_all[idx_order]; p90_sorted=p90_all[idx_order]
+        # --- Extract Data for Plotting ---
+        # Predictions (p10, p50, p90)
+        preds_tensor = preds_dict['prediction'].cpu() # Shape: (n_samples, pred_len, n_quantiles)
+        p10_flat = preds_tensor[:, :, 0].flatten().numpy()
+        p50_flat = preds_tensor[:, :, 1].flatten().numpy()
+        p90_flat = preds_tensor[:, :, 2].flatten().numpy()
 
+        # Actuals aligned with predictions (from the decoder part of the input)
+        actuals_flat = x_dict['decoder_target'].flatten().cpu().numpy()
+
+        # Time index aligned with predictions
+        time_idx_flat = index_df['time_idx'].values
+
+        # --- Verify and Match Lengths ---
+        n_preds = len(p50_flat)
+        n_actuals = len(actuals_flat)
+        n_time = len(time_idx_flat)
+
+        logger.debug(f"Plotting data shapes - Preds: {n_preds}, Actuals: {n_actuals}, Time: {n_time}")
+
+        if not (n_preds == n_actuals == n_time):
+            logger.warning(f"Data length mismatch for plotting! Preds={n_preds}, Actuals={n_actuals}, Time={n_time}. Attempting truncation.")
+            min_len_plot = min(n_preds, n_actuals, n_time)
+            if min_len_plot == 0: logger.error("Zero length data for plotting. Skipping plots."); return results
+            p10_flat=p10_flat[:min_len_plot]; p50_flat=p50_flat[:min_len_plot]; p90_flat=p90_flat[:min_len_plot]
+            actuals_flat=actuals_flat[:min_len_plot]; time_idx_flat=time_idx_flat[:min_len_plot]
+            logger.info(f"Truncated plotting data length to: {min_len_plot}")
+
+        # Ensure we have more than one point if truncation happened
+        if len(np.unique(time_idx_flat)) <= 1:
+             logger.warning("Plotting data only contains one unique time index or is empty after alignment/truncation. Plots might look sparse.")
+             # Proceed anyway, but plots might be misleading
+
+        # Clip predictions
+        p10_flat = np.maximum(0, p10_flat)
+        p50_flat = np.maximum(0, p50_flat)
+        p90_flat = np.maximum(0, p90_flat)
+
+        # --- Sort data by time index for line plots ---
+        sort_indices = np.argsort(time_idx_flat)
+        time_idx_sorted = time_idx_flat[sort_indices]
+        actuals_sorted = actuals_flat[sort_indices]
+        p10_sorted = p10_flat[sort_indices]
+        p50_sorted = p50_flat[sort_indices]
+        p90_sorted = p90_flat[sort_indices]
+
+        # --- Generate Plots ---
+        # 1. Aggregated Forecast Plot
         try: min_date_str = dataset.data["raw"]["month_date"].min().strftime('%Y-%m'); x_label = f"Time Index (Months since {min_date_str})"
         except Exception: x_label = "Time Index"
 
-        plt.figure(figsize=(15, 7)); plt.plot(time_idx_sorted, act_sorted, label="Actual Deaths", marker='.', linestyle='-', alpha=0.6, color='black', markersize=4)
-        plt.plot(time_idx_sorted, p50_sorted, label="Predicted Median (p50)", linestyle='--', alpha=0.8, color='tab:orange', linewidth=1.5)
-        plt.fill_between(time_idx_sorted, p10_sorted, p90_sorted, color='tab:orange', alpha=0.25, label='p10-p90 Quantiles')
-        plt.title(f"TFT Aggregated Forecast vs Actuals (Validation Set - Monthly)\nMAE={val_mae:.2f}, SMAPE={val_smape:.2f}%", fontsize=14); plt.xlabel(x_label, fontsize=12); plt.ylabel("Monthly Deaths", fontsize=12)
+        plt.figure(figsize=(15, 7))
+        plt.plot(time_idx_sorted, actuals_sorted, label="Actual Deaths", marker='.', linestyle='-', alpha=0.7, color='black', markersize=4) # Increased visibility
+        plt.plot(time_idx_sorted, p50_sorted, label="Predicted Median (p50)", linestyle='--', alpha=0.9, color='tab:orange', linewidth=1.5) # Increased visibility
+        plt.fill_between(time_idx_sorted, p10_sorted, p90_sorted, color='tab:orange', alpha=0.3, label='p10-p90 Quantiles') # Lighter fill
+        plt.title(f"TFT Aggregated Forecast vs Actuals (Validation Set - Monthly)\nMAE={val_mae:.2f}, SMAPE={val_smape:.2f}%", fontsize=14)
+        plt.xlabel(x_label, fontsize=12); plt.ylabel("Monthly Deaths", fontsize=12)
         plt.legend(fontsize=10); plt.grid(True, linestyle=':', alpha=0.7); plt.tight_layout()
-        plot_file = os.path.join(plot_dir, "tft_val_forecast_aggregated.png"); plt.savefig(plot_file); logger.info(f"Saved aggregated forecast plot to {plot_file}"); plt.close()
+        plot_file = os.path.join(plot_dir, "tft_val_forecast_aggregated.png")
+        plt.savefig(plot_file); logger.info(f"Saved aggregated forecast plot to {plot_file}"); plt.close()
 
-        residuals = act_sorted - p50_sorted
-        plt.figure(figsize=(10, 6)); plt.scatter(p50_sorted, residuals, alpha=0.3, s=15, color='tab:blue', edgecolors='w', linewidth=0.5)
-        plt.axhline(0, color='red', linestyle='--', linewidth=1); plt.title('Residual Plot (Actuals - Median Predictions)', fontsize=14)
-        plt.xlabel('Predicted Median Deaths', fontsize=12); plt.ylabel('Residuals', fontsize=12); plt.grid(True, linestyle=':', alpha=0.7); plt.tight_layout()
-        save_path_res = os.path.join(plot_dir, "residuals_monthly_plot.png"); plt.savefig(save_path_res); logger.info(f"Saved residual plot to {save_path_res}"); plt.close()
-    except Exception as e: logger.warning(f"Evaluation plotting failed: {e}", exc_info=True)
-    finally: plt.close('all')
+        # 2. Residual Plot
+        residuals = actuals_sorted - p50_sorted # Use sorted values for consistency
+        plt.figure(figsize=(10, 6))
+        plt.scatter(p50_sorted, residuals, alpha=0.4, s=20, color='tab:blue', edgecolors='k', linewidth=0.5) # Adjusted style
+        plt.axhline(0, color='red', linestyle='--', linewidth=1)
+        plt.title('Residual Plot (Actuals - Median Predictions)', fontsize=14)
+        plt.xlabel('Predicted Median Deaths', fontsize=12); plt.ylabel('Residuals', fontsize=12)
+        plt.grid(True, linestyle=':', alpha=0.7); plt.tight_layout()
+        save_path_res = os.path.join(plot_dir, "residuals_monthly_plot.png")
+        plt.savefig(save_path_res); logger.info(f"Saved residual plot to {save_path_res}"); plt.close()
+
+    except Exception as e:
+        logger.warning(f"Evaluation plotting failed: {e}", exc_info=True)
+    finally:
+        plt.close('all') # Close all figures just in case
+
     return results
 
 # -----------------------------------------------------------------------------
@@ -825,6 +905,65 @@ def plot_monthly_boxplot(df: pd.DataFrame, column: str, title: str, filename: st
     except Exception as e: logger.error(f"Plot fail {filename}: {e}", exc_info=True)
     finally: plt.close()
 
+
+def plot_granger_causality_results(p_values_dict: Dict[str, Optional[Dict[int, float]]], title_prefix: str, plot_dir: str):
+    """
+    Plots the p-values from Granger Causality tests.
+    p_values_dict: {'Test Description': {lag: p_value}, ...}
+    """
+    if not p_values_dict:
+        logger.warning("No Granger causality results to plot.")
+        return
+
+    num_tests = len(p_values_dict)
+    if num_tests == 0: return
+
+    fig, axes = plt.subplots(nrows=num_tests, ncols=1, figsize=(10, 4 * num_tests), squeeze=False)
+    axes = axes.flatten() # Ensure axes is always iterable
+
+    fig.suptitle(f"{title_prefix} Granger Causality P-Values (Lower is More Significant)", fontsize=14, y=1.02)
+
+    plot_count = 0
+    for i, (test_description, p_values) in enumerate(p_values_dict.items()):
+        ax = axes[i]
+        if p_values is None:
+            ax.text(0.5, 0.5, 'Test Failed or Skipped', horizontalalignment='center', verticalalignment='center', transform=ax.transAxes)
+            ax.set_title(f"Test: {test_description}")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            continue
+
+        lags = list(p_values.keys())
+        pvals = list(p_values.values())
+
+        bars = ax.bar(lags, pvals, color='lightblue', edgecolor='black')
+        ax.axhline(y=0.05, color='red', linestyle='--', linewidth=1, label='p = 0.05 Threshold')
+
+        # Highlight significant bars
+        for lag_idx, p in enumerate(pvals):
+            if p < 0.05:
+                bars[lag_idx].set_color('salmon')
+                bars[lag_idx].set_edgecolor('red')
+
+        ax.set_title(f"Test: {test_description}")
+        ax.set_xlabel("Lag (Months)")
+        ax.set_ylabel("P-value")
+        ax.set_xticks(lags)
+        ax.set_ylim(0, 1.05) # Set y-axis limit to focus below 0.05 but show full scale
+        ax.legend()
+        ax.grid(True, axis='y', linestyle=':', alpha=0.7)
+        plot_count += 1
+
+    if plot_count > 0:
+        plt.tight_layout(rect=[0, 0, 1, 0.98]) # Adjust layout
+        filename = f"{title_prefix.lower().replace(' ','_')}_granger_causality.png"
+        save_path = os.path.join(plot_dir, filename)
+        plt.savefig(save_path)
+        logger.info(f"Saved Granger causality plot to {save_path}")
+        plt.close(fig)
+    else:
+        logger.warning("No valid Granger results were plotted.")
+        plt.close(fig)
 # -----------------------------------------------------------------------------
 # 7. Interpretation & Granger Causality  
 # -----------------------------------------------------------------------------
@@ -857,22 +996,39 @@ def interpret_tft(model: TemporalFusionTransformer, val_dataloader: torch.utils.
     except Exception as e: logger.error(f"Error during interpretation: {e}", exc_info=True)
     finally: model.to(DEVICE); plt.close('all')
 
-def run_granger_causality(df: pd.DataFrame, var1: str, var2: str, max_lag: int = 12):
+def run_granger_causality(df: pd.DataFrame, var1: str, var2: str, max_lag: int = 12) -> Optional[Dict[int, float]]:
+    """
+    Performs Granger Causality tests between two variables in a DataFrame.
+    Tests if var1 Granger-causes var2 using first differences.
+    Returns a dictionary {lag: p_value} or None if the test cannot be run.
+    """
     logger.info(f"Running Granger Causality test: '{var1}' -> '{var2}'? (Max lag: {max_lag})")
-    if var1 not in df.columns or var2 not in df.columns: logger.error(f"Granger cols missing. Skip."); return
+    results = {}
+    if var1 not in df.columns or var2 not in df.columns: logger.error(f"Granger cols missing. Skip."); return None
     data = df[[var1, var2]].copy()
     if data.isnull().values.any(): logger.warning(f"NaNs found in Granger data: {data.isnull().sum()}. Drop."); data.dropna(inplace=True)
-    if data.shape[0] < max_lag + 5: logger.error(f"Not enough data ({data.shape[0]}) for Granger test after dropna. Skip."); return
+    if data.shape[0] < max_lag + 5: logger.error(f"Not enough data ({data.shape[0]}) for Granger test after dropna. Skip."); return None
     try: data_diff = data.diff().dropna()
-    except Exception as e: logger.error(f"Granger differencing error: {e}. Skip."); return
-    if data_diff.shape[0] < max_lag + 5: logger.error(f"Not enough data ({data_diff.shape[0]}) after differencing. Skip."); return
+    except Exception as e: logger.error(f"Granger differencing error: {e}. Skip."); return None
+    if data_diff.shape[0] < max_lag + 5: logger.error(f"Not enough data ({data_diff.shape[0]}) after differencing. Skip."); return None
     logger.info("Using first differences for Granger test.")
     try:
+        # Note: Order matters for interpretation. Testing if var1 (column 1) causes var2 (column 0).
         gc_result = grangercausalitytests(data_diff[[var2, var1]], maxlag=max_lag, verbose=False)
-        significant_lags = [lag for lag in range(1, max_lag + 1) if gc_result[lag][0]['ssr_ftest'][1] < 0.05]
+        p_values = {}
+        significant_lags = []
+        for lag in range(1, max_lag + 1):
+            # Extract p-value from the ssr_ftest result
+            p_value = gc_result[lag][0]['ssr_ftest'][1]
+            p_values[lag] = p_value
+            if p_value < 0.05:
+                significant_lags.append(lag)
+
         if significant_lags: logger.info(f" Granger Result ('{var1}' -> '{var2}'): Significant at lags: {significant_lags} (p < 0.05).")
         else: logger.info(f" Granger Result ('{var1}' -> '{var2}'): Not significant up to lag {max_lag} (p >= 0.05).")
-    except Exception as e: logger.error(f"Granger test error: {e}", exc_info=True)
+        return p_values # Return the dictionary of p-values
+
+    except Exception as e: logger.error(f"Granger test error: {e}", exc_info=True); return None
 
 # -----------------------------------------------------------------------------
 # 8. MAIN Execution Logic
@@ -956,10 +1112,26 @@ def main():
             if best_model and val_dl: interpret_tft(best_model, val_dl, PLOT_DIR)
             else: logger.warning("Skipping TFT interpretation.")
             # Run Granger on the chosen raw aggregation features
+            # --- Granger Causality ---
             logger.info("--- Running Granger Causality Tests ---")
-            run_granger_causality(final_df, raw_fear_col, 'deaths', max_lag=12)
-            run_granger_causality(final_df, lag1_fear_col, 'deaths', max_lag=12)
-            run_granger_causality(final_df, 'deaths', raw_fear_col, max_lag=12) # Reverse direction
+            granger_results = {} # Dictionary to store p-values
+
+            # Test if fear predicts deaths
+            desc1 = f"'{raw_fear_col}' -> 'deaths'"
+            granger_results[desc1] = run_granger_causality(final_df, raw_fear_col, 'deaths', max_lag=12)
+
+            # Test if lagged fear predicts deaths
+            desc2 = f"'{lag1_fear_col}' -> 'deaths'"
+            granger_results[desc2] = run_granger_causality(final_df, lag1_fear_col, 'deaths', max_lag=12)
+
+            # Test if lagged deaths predict fear (Reverse relationship)
+            desc3 = f"'deaths' -> '{raw_fear_col}'"
+            granger_results[desc3] = run_granger_causality(final_df, 'deaths', raw_fear_col, max_lag=12)
+
+            # Plot the results
+            plot_granger_causality_results(granger_results, title_prefix=f"Fear ({AGGREGATION_METHOD}) vs Deaths", plot_dir=PLOT_DIR)
+
+            # Note: Consider DLMs as discussed in the paper for more direct lag analysis.
         else: logger.warning("Final DataFrame empty, skipping interpretation & Granger.")
 
     except FileNotFoundError as e: logger.error(f"Data file not found: {e}.")
