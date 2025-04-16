@@ -93,8 +93,8 @@ from joblib import Memory
 OLD_BAILEY_DIR = '/Users/sebo/Desktop/AUC/Semester 6/Capstone/Programming/oldbailey/sessionsPapers/' # *** YOUR PATH ***
 COUNTS_FILE = '/Users/sebo/Desktop/AUC/Semester 6/Capstone/Programming/WeeklyBillsMortality1644to1849/counts.txt' # *** YOUR PATH ***
 HISTORICAL_DICT_PATH = "historical_dict.txt" # Optional
-START_YEAR = 1675 # Old Bailey data starts around here
-END_YEAR = 1800   # Align end year with previous analysis for now
+START_YEAR = 1678 # Old Bailey data starts around here
+END_YEAR = 1849   # Align end year with previous analysis for now
 INFECTIOUS_DISEASE_TYPES = None # Use None for total mortality (excluding christened)
 
 # --- Sentiment Analysis Config ---
@@ -307,10 +307,29 @@ def parse_old_bailey_papers(ob_dir: str = OLD_BAILEY_DIR, start_year: int = STAR
     logger.info(f" Errors during parsing: {parse_errors}. Date parse attempts: {date_parse_attempts}")
     if not records: return pd.DataFrame(columns=["week_date", "text", "doc_id"])
 
-    df = pd.DataFrame(records)
+    # Define the minimum representable date in pandas ns precision
+    # (approximately 1677-09-21, let's use 1678-01-01 to be safe)
+    min_pandas_date = datetime(1678, 1, 1)
+    # You could also adjust START_YEAR in config to 1678 if acceptable
+
+    # Filter records *before* creating the DataFrame
+    original_record_count = len(records)
+    filtered_records = [r for r in records if r['week_date'] >= min_pandas_date]
+    filtered_count = len(filtered_records)
+    if filtered_count < original_record_count:
+        logger.warning(f"Filtered out {original_record_count - filtered_count} Old Bailey records with dates before {min_pandas_date.strftime('%Y-%m-%d')} due to Pandas timestamp limitations.")
+
+    if not filtered_records:
+         logger.error("No Old Bailey records remain after filtering for valid Pandas date range.")
+         return pd.DataFrame(columns=["week_date", "text", "doc_id"])
+
+    # Now create the DataFrame only with valid dates
+    df = pd.DataFrame(filtered_records)
     df['text'] = df['text'].astype(str)
-    df['week_date'] = pd.to_datetime(df['week_date']) # Ensure datetime
-    logger.info(f"Old Bailey DataFrame prepared: {df.shape[0]} records. Date Range: {df['week_date'].min():%Y-%m-%d} to {df['week_date'].max():%Y-%m-%d}")
+    # This conversion should now succeed
+    df['week_date'] = pd.to_datetime(df['week_date'])
+
+    logger.info(f"Old Bailey DataFrame prepared: {df.shape[0]} records (after date filtering). Date Range: {df['week_date'].min():%Y-%m-%d} to {df['week_date'].max():%Y-%m-%d}")
     return df
 
 
@@ -349,15 +368,52 @@ def load_and_aggregate_weekly_mortality(file_path: str = COUNTS_FILE, disease_ty
     if len(df) < original_len: logger.warning(f"Dropped {original_len - len(df)} rows non-numeric 'countn'.")
 
     logger.info("Parsing week IDs to week start dates (Monday)...")
-    df["week_date"] = df["weekID"].astype(str).apply(parse_bill_weekID_to_weekly)
-    original_len = len(df); df.dropna(subset=["week_date"], inplace=True)
-    if (original_len - len(df)) > 0: logger.info(f"Dropped {original_len - len(df)} rows invalid weekID/date.")
+    df["week_date_obj"] = df["weekID"].astype(str).apply(parse_bill_weekID_to_weekly) # Store results temporarily
 
-    df["year"] = df["week_date"].dt.isocalendar().year # Use ISO year
-    df = df[(df['year'] >= start_year) & (df['year'] <= end_year)]
-    if df.empty: logger.warning(f"No mortality records in range {start_year}-{end_year}."); return pd.DataFrame(columns=["week_date", "year", "week_of_year", "deaths"])
-    logger.info(f"{len(df)} weekly records after date range filter ({start_year}-{end_year}).")
+    # --- Filter rows with valid dates AND within rough year range FIRST ---
+    original_len = len(df)
+    # Also filter out rows where week_date_obj is None (parsing failed)
+    df = df.dropna(subset=["week_date_obj"]).copy()
 
+    # *** ADD PRE-FILTER BASED ON YEAR ***
+    # This requires extracting year from week_date_obj BEFORE full conversion
+    # This is safe because parse_bill_weekID_to_weekly returns datetime objects
+    try:
+        df['temp_year'] = df['week_date_obj'].apply(lambda x: x.isocalendar().year if pd.notnull(x) else None)
+        df.dropna(subset=['temp_year'], inplace=True) # Drop if year extraction failed
+        df['temp_year'] = df['temp_year'].astype(int)
+        df = df[(df['temp_year'] >= start_year) & (df['temp_year'] <= end_year)].copy()
+        df = df.drop(columns=['temp_year']) # Remove temporary column
+    except Exception as e:
+         logger.error(f"Error during pre-filtering by year: {e}. Proceeding without pre-filter, might still fail.")
+
+    dropped_rows = original_len - len(df)
+    if dropped_rows > 0:
+        logger.info(f"Dropped {dropped_rows} rows with invalid weekID/date or outside year range {start_year}-{end_year}.")
+
+    if df.empty:
+         logger.warning("No rows remaining after initial date parsing and year filtering.")
+         return pd.DataFrame(columns=["week_date", "year", "week_of_year", "deaths"])
+
+    # --- NOW convert the (already filtered) column to datetime ---
+    try:
+        # This should now succeed as all rows have valid datetime objects within pandas range
+        df['week_date'] = pd.to_datetime(df['week_date_obj'])
+    except pd._libs.tslibs.np_datetime.OutOfBoundsDatetime as e:
+        logger.error(f"OutOfBoundsDatetime error persist AFTER filtering: {e}. Check START_YEAR ({start_year}) config.")
+        # Optionally print problematic dates:
+        problematic_dates = df.loc[pd.to_datetime(df['week_date_obj'], errors='coerce').isna(), 'week_date_obj']
+        logger.error(f"Problematic date objects (first 5): {problematic_dates.head().tolist()}")
+        raise e # Re-raise the error as it's unexpected now
+
+    df = df.drop(columns=['week_date_obj']) # We no longer need the temporary column
+
+    # --- Filter by Year Range (Redundant check, but safe) ---
+    df["year"] = df["week_date"].dt.isocalendar().year
+    # This filter should ideally not remove anything now, but kept as safeguard
+    df = df[(df['year'] >= start_year) & (df['year'] <= end_year)].copy()
+
+    # --- Continue with type filtering and aggregation ---
     df['counttype'] = df['counttype'].str.lower().str.strip()
     df = df[df["counttype"] != "christened"]
     if disease_types: df = df[df["counttype"].isin([d.lower() for d in disease_types])]
@@ -369,6 +425,7 @@ def load_and_aggregate_weekly_mortality(file_path: str = COUNTS_FILE, disease_ty
     weekly_sum = df.groupby("week_date")["countn"].sum().reset_index()
     weekly_sum.rename(columns={"countn": "deaths"}, inplace=True)
     weekly_sum["deaths"] = weekly_sum["deaths"].astype(float)
+    # Re-calculate year and week from the final aggregated week_date
     weekly_sum["year"] = weekly_sum["week_date"].dt.isocalendar().year
     weekly_sum["week_of_year"] = weekly_sum["week_date"].dt.isocalendar().week
     weekly_sum = weekly_sum.sort_values("week_date").reset_index(drop=True)
