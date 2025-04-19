@@ -92,3 +92,22 @@ lightning_logs/tft_fear_model_weekly/version_0/03059/year/metadata.tsv
 lightning_logs/tft_fear_model_weekly/version_0/03059/year/tensors.tsv
 lightning_logs/tft_fear_model_weekly/version_0/checkpoints/epoch=22-step=3059.ckpt
 lightning_logs/tft_fear_model_weekly/version_0/projector_config.pbtxt
+cache_dir_weekly_oldbailey/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/aggregate_combined_metrics/382938c02d63dad153648e8c9ff45ad6/metadata.json
+cache_dir_weekly_oldbailey/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/aggregate_combined_metrics/382938c02d63dad153648e8c9ff45ad6/output.pkl
+cache_dir_weekly_oldbailey/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/aggregate_combined_metrics/func_code.py
+cache_dir_weekly_oldbailey/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/aggregate_weekly_sentiment_and_merge/9ba5f4c7011dfeb03d0e816cca51fecc/metadata.json
+cache_dir_weekly_oldbailey/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/aggregate_weekly_sentiment_and_merge/9ba5f4c7011dfeb03d0e816cca51fecc/output.pkl
+cache_dir_weekly_oldbailey/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/calculate_fear_scores_dataframe/17667ef18d69aec798a361165ffc739b/metadata.json
+cache_dir_weekly_oldbailey/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/calculate_fear_scores_dataframe/17667ef18d69aec798a361165ffc739b/output.pkl
+cache_dir_weekly_oldbailey/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/preprocess_text_dataframe/7366c5f97b027ae599342d9254f75c49/metadata.json
+cache_dir_weekly_oldbailey/joblib/__main__--Users-sebo-Desktop-AUC-Semester 6-Capstone-Seb Olsen Capstone Repo-Fear-and-Mortality-Capstone-Script2/preprocess_text_dataframe/7366c5f97b027ae599342d9254f75c49/output.pkl
+lightning_logs/tft_combined_metrics_weekly_log_target/version_0/03696/series_id/metadata.tsv
+lightning_logs/tft_combined_metrics_weekly_log_target/version_0/03696/series_id/tensors.tsv
+lightning_logs/tft_combined_metrics_weekly_log_target/version_0/03696/week_of_year/metadata.tsv
+lightning_logs/tft_combined_metrics_weekly_log_target/version_0/03696/week_of_year/tensors.tsv
+lightning_logs/tft_combined_metrics_weekly_log_target/version_0/03696/year/metadata.tsv
+lightning_logs/tft_combined_metrics_weekly_log_target/version_0/03696/year/tensors.tsv
+lightning_logs/tft_combined_metrics_weekly_log_target/version_0/checkpoints/epoch=27-step=3696.ckpt
+lightning_logs/tft_combined_metrics_weekly_log_target/version_0/events.out.tfevents.1745056996.sebs-mbp.home.11694.0
+lightning_logs/tft_combined_metrics_weekly_log_target/version_0/hparams.yaml
+lightning_logs/tft_combined_metrics_weekly_log_target/version_0/projector_config.pbtxt
