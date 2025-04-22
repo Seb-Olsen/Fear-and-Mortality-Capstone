@@ -22,6 +22,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import xml.etree.ElementTree as ET
 from typing import Dict, Tuple, Union, List, Optional
+from tqdm.auto import tqdm
+from statsmodels.tsa.stattools import ccf
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 
 # Suppress warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -97,6 +100,15 @@ START_YEAR = 1678 # Old Bailey data starts around here
 END_YEAR = 1849   # Align end year with previous analysis for now
 INFECTIOUS_DISEASE_TYPES = None # Use None for total mortality (excluding christened)
 
+# Word lists for targeted sentiment
+DISEASE_FEAR_WORDS = ["pestilence", "plague", "contagion", "infection", "epidemic", "pox", "sickness", "disease", "illness", "malady", "distemper", "smallpox", "sweating"]
+HARDSHIP_WORDS = ["poor", "poverty", "necessity", "distress", "hardship", "starve", "desperate", "ruin", "beggar", "vagran", "hunger", "want"]
+VIOLENCE_SEVERITY_WORDS = ["kill", "murder", "murther", "wound", "stab", "pistol", "weapon", "sword", "hanger", "deadly", "death", "slay", "violence"]
+OVERALL_DISTRESS_WORDS = DISEASE_FEAR_WORDS # Use the original broad list (assuming FEAR_WORDS is defined)
+
+# Define the LAG_WEEKS constant
+LAG_WEEKS = 4
+
 # --- Sentiment Analysis Config ---
 MACBERTH_MODEL_NAME = 'emanjavacas/MacBERTh'
 FEAR_WORDS = [ # Refined list including crime context
@@ -119,7 +131,7 @@ FEAR_THRESHOLD = 0.70 # Example threshold if using 'proportion'
 # --- TFT Parameters (Weekly) ---
 MAX_EPOCHS = 50
 BATCH_SIZE = 64 # Can often increase slightly for weekly data vs monthly
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0005
 HIDDEN_SIZE = 32
 ATTENTION_HEAD_SIZE = 2
 DROPOUT = 0.2
@@ -753,61 +765,146 @@ def preprocess_text_dataframe(df: pd.DataFrame, text_col: str = "text", use_syms
     logger.info(f"Text preprocessing complete. Shape: {df_copy.shape}")
     return df_copy
 
+# === Fear Scoring using MacBERTh (MODIFIED FOR MULTIPLE SENTIMENTS) ===
+class MacBERThSentimentScorer:
+    _instance = None
+    _model_name = MACBERTH_MODEL_NAME
+    # Define the word lists and corresponding score names HERE
+    _word_lists = {
+        'disease_sentiment': DISEASE_FEAR_WORDS,
+        'hardship_sentiment': HARDSHIP_WORDS
+    }
 
-# === Fear Scoring using MacBERTh (Unchanged Class, applied to Old Bailey) ===
-class MacBERThFearScorer:
-    _instance = None; _model_name = MACBERTH_MODEL_NAME; _fear_words = FEAR_WORDS
     def __new__(cls, *args, **kwargs):
-        if cls._instance is None: logger.info(f"Creating MacBERThFearScorer instance..."); cls._instance = super().__new__(cls); cls._instance._initialized = False
+        if cls._instance is None:
+            logger.info(f"Creating MacBERThSentimentScorer instance...")
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
         return cls._instance
+
     def __init__(self, device: Optional[Union[str, torch.device]] = None):
-        if self._initialized: return
+        if self._initialized:
+            return
         logger.info(f"Initializing MacBERTh model for embedding: {self._model_name}...")
-        self.device = device if device else DEVICE; logger.info(f"MacBERTh on device: {self.device}")
+        self.device = device if device else DEVICE
+        logger.info(f"MacBERTh on device: {self.device}")
+        self.reference_vectors = {} # Dictionary to hold reference vectors
+
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(self._model_name)
-            self.model = AutoModel.from_pretrained(self._model_name).to(self.device); self.model.eval()
-            logger.info("Calculating average fear vector embedding...")
+            self.model = AutoModel.from_pretrained(self._model_name).to(self.device)
+            self.model.eval()
+
+            logger.info("Calculating average reference vectors for each sentiment type...")
             with torch.no_grad():
-                fear_inputs = self.tokenizer(self._fear_words, padding=True, truncation=True, return_tensors="pt").to(self.device)
-                fear_outputs = self.model(**fear_inputs)
-                fear_embeddings = self._mean_pooling(fear_outputs, fear_inputs['attention_mask']).cpu().numpy()
-            self.average_fear_vector = np.mean(fear_embeddings, axis=0).reshape(1, -1)
-            logger.info(f"Average fear vector calculated (shape: {self.average_fear_vector.shape}).")
+                # Iterate through the specified word lists
+                for score_name, word_list in self._word_lists.items():
+                    if not word_list:
+                        logger.warning(f"Word list for '{score_name}' is empty. Skipping.")
+                        self.reference_vectors[score_name] = None
+                        continue
+                    valid_word_list = [str(w) for w in word_list if isinstance(w, str) and w]
+                    if not valid_word_list:
+                         logger.warning(f"Valid word list for '{score_name}' is empty after filtering. Skipping.")
+                         self.reference_vectors[score_name] = None
+                         continue
+
+                    inputs = self.tokenizer(valid_word_list, padding=True, truncation=True, return_tensors="pt", max_length=512).to(self.device)
+                    outputs = self.model(**inputs)
+                    embeddings = self._mean_pooling(outputs, inputs['attention_mask']).cpu().numpy()
+                    avg_vector = np.mean(embeddings, axis=0).reshape(1, -1)
+                    self.reference_vectors[score_name] = avg_vector
+                    logger.info(f" - Calculated reference vector for '{score_name}' (shape: {avg_vector.shape}).")
+
             self._initialized = True
-        except Exception as e: logger.error(f"Failed init MacBERTh: {e}", exc_info=True); raise
+            logger.info("MacBERThSentimentScorer initialization complete.")
+        except Exception as e:
+            logger.error(f"Failed to initialize MacBERTh scorer: {e}", exc_info=True)
+            raise
+
     def _mean_pooling(self, model_output, attention_mask):
-        token_embeddings = model_output[0]; input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1); sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+        token_embeddings = model_output[0]
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
         return sum_embeddings / sum_mask
+
     @torch.no_grad()
-    def calculate_fear_scores(self, texts: List[str], batch_size: int = 32) -> List[float]:
+    def calculate_sentiment_scores(self, texts: List[str], batch_size: int = 32) -> Dict[str, List[float]]:
+        """Calculates multiple sentiment scores for a list of texts."""
         if not self._initialized: raise RuntimeError("Scorer not initialized.")
-        if not texts: return []
-        all_fear_scores = []; num_texts = len(texts); logger.info(f"Calculating fear scores for {num_texts} texts...")
-        log_interval = max(1, (num_texts // batch_size) // 10)
-        for i in range(0, num_texts, batch_size):
-            batch_texts = texts[i : i + batch_size]; valid_batch_texts = [str(t) if t else "" for t in batch_texts]
-            inputs = self.tokenizer(valid_batch_texts, padding=True, truncation=True, return_tensors="pt", max_length=512).to(self.device)
-            outputs = self.model(**inputs)
-            embeddings = self._mean_pooling(outputs, inputs['attention_mask']).cpu().numpy()
-            similarities = cosine_similarity(embeddings, self.average_fear_vector)
-            all_fear_scores.extend(similarities.flatten().tolist())
-            if (i // batch_size + 1) % log_interval == 0: logger.info(f" Scored {min(i + batch_size, num_texts)}/{num_texts}...")
-        if len(all_fear_scores) != num_texts: logger.error(f"Score length mismatch: {len(all_fear_scores)} vs {num_texts}. Pad."); all_fear_scores.extend([0.0] * (num_texts - len(all_fear_scores)))
-        logger.info("Fear score calculation complete.")
-        return all_fear_scores
+        if not texts: return {score_name: [] for score_name in self.reference_vectors}
+
+        num_texts = len(texts)
+        all_scores = {score_name: [] for score_name in self.reference_vectors if self.reference_vectors.get(score_name) is not None} # Use .get() for safety
+        valid_score_names = list(all_scores.keys())
+        if not valid_score_names:
+            logger.warning("No valid reference vectors calculated. Returning empty scores dict.")
+            return {}
+
+        logger.info(f"Calculating {len(valid_score_names)} types of sentiment scores for {num_texts} texts...")
+        log_interval = max(1, (num_texts // batch_size) // 10) if batch_size > 0 else num_texts # Avoid division by zero
+
+        # Wrap the range with tqdm for a progress bar
+        for i in tqdm(range(0, num_texts, batch_size), desc="Calculating Sentiment Scores"): # <<<--- WRAP HERE
+            batch_texts = texts[i : i + batch_size]
+            valid_batch_texts = [str(t) if t else "" for t in batch_texts]
+            try:
+                inputs = self.tokenizer(valid_batch_texts, padding=True, truncation=True, return_tensors="pt", max_length=512).to(self.device)
+                outputs = self.model(**inputs)
+                embeddings = self._mean_pooling(outputs, inputs['attention_mask']).cpu().numpy()
+                for score_name in valid_score_names:
+                    ref_vector = self.reference_vectors[score_name]
+                    similarities = cosine_similarity(embeddings, ref_vector)
+                    all_scores[score_name].extend(similarities.flatten().tolist())
+            except Exception as e:
+                 logger.error(f"Error processing batch starting at index {i}: {e}. Appending zeros.")
+                 batch_len = len(valid_batch_texts)
+                 for score_name in valid_score_names:
+                     all_scores[score_name].extend([0.0] * batch_len)
+
+        for score_name in valid_score_names:
+            if len(all_scores[score_name]) != num_texts:
+                logger.error(f"Score length mismatch '{score_name}'. Padding."); all_scores[score_name].extend([0.0] * (num_texts - len(all_scores[score_name])))
+        logger.info("Sentiment score calculation complete.")
+        return all_scores
 
 @memory.cache
-def calculate_fear_scores_dataframe(df: pd.DataFrame, text_col: str = "processed_text", batch_size: int = 32) -> pd.DataFrame:
-    logger.info(f"Calculating MacBERTh scores for '{text_col}'...")
-    if text_col not in df.columns: raise ValueError(f"Col '{text_col}' NF.")
-    if df[text_col].isnull().any(): logger.warning(f"'{text_col}' has NaNs. Fill empty."); df[text_col] = df[text_col].fillna('')
-    df_copy = df.copy(); scorer = MacBERThFearScorer(); texts_to_score = df_copy[text_col].tolist()
-    fear_scores = scorer.calculate_fear_scores(texts_to_score, batch_size=batch_size)
-    df_copy["fear_score"] = fear_scores
-    logger.info("Fear scoring done."); logger.info(f"Stats: Min={np.min(fear_scores):.3f}, Max={np.max(fear_scores):.3f}, Mean={np.mean(fear_scores):.3f}, Std={np.std(fear_scores):.3f}")
-    return df_copy
+def calculate_sentiment_scores_dataframe(df: pd.DataFrame, text_col: str = "text", batch_size: int = 32) -> pd.DataFrame:
+    """Calculates multiple MacBERTh sentiment scores for the text column."""
+    logger.info(f"Calculating multiple MacBERTh sentiment scores for '{text_col}'...")
+    if text_col not in df.columns: raise ValueError(f"Column '{text_col}' not found.")
+
+    df_copy = df.copy()
+    # Ensure text column is string and handle NaNs
+    df_copy[text_col] = df_copy[text_col].astype(str).fillna('')
+
+    scorer = MacBERThSentimentScorer() # Initialize the multi-score scorer
+    texts_to_score = df_copy[text_col].tolist()
+
+    # Get the dictionary of scores {score_name: [list_of_scores]}
+    sentiment_scores_dict = scorer.calculate_sentiment_scores(texts_to_score, batch_size=batch_size)
+
+    # Add each score list as a new column to the DataFrame
+    score_cols_added = []
+    for score_name, scores_list in sentiment_scores_dict.items():
+        if scores_list: # Only add if scores were calculated
+             # Ensure score name doesn't clash with existing columns if df_copy is reused
+             if score_name in df_copy.columns:
+                 logger.warning(f"Column '{score_name}' already exists. Overwriting.")
+             df_copy[score_name] = scores_list
+             score_cols_added.append(score_name) # Keep track of added columns
+             logger.info(f"Added sentiment scores for '{score_name}'. Stats: Min={np.min(scores_list):.3f}, Max={np.max(scores_list):.3f}, Mean={np.mean(scores_list):.3f}, Std={np.std(scores_list):.3f}")
+        else:
+             logger.warning(f"No scores calculated for '{score_name}', column not added.")
+
+    logger.info("Multiple sentiment scoring complete.")
+    # Return relevant identifier columns along with the new scores
+    # Ensure identifiers exist in the input df
+    id_cols = ['week_date', 'doc_id', 'trial_id']
+    valid_id_cols = [col for col in id_cols if col in df_copy.columns]
+    final_cols = valid_id_cols + score_cols_added
+    return df_copy[final_cols]
 
 @memory.cache
 def load_and_aggregate_weekly_mortality(file_path: str = COUNTS_FILE, disease_types: Optional[List[str]] = INFECTIOUS_DISEASE_TYPES, start_year: int = START_YEAR, end_year: int = END_YEAR) -> pd.DataFrame:
@@ -892,136 +989,281 @@ def load_and_aggregate_weekly_mortality(file_path: str = COUNTS_FILE, disease_ty
 
 # === Data Aggregation and Merging (WEEKLY - UPDATED) ===
 @memory.cache
-def aggregate_weekly_sentiment_and_merge(text_df: pd.DataFrame, weekly_mortality_df: pd.DataFrame, agg_method: str = AGGREGATION_METHOD, fear_thresh: float = FEAR_THRESHOLD) -> pd.DataFrame:
+def aggregate_weekly_combined_metrics(
+    structured_df: pd.DataFrame,  # Output from parse_old_bailey_papers
+    sentiment_df: pd.DataFrame,  # Output from calculate_sentiment_scores_dataframe
+    weekly_mortality_df: pd.DataFrame
+    ) -> pd.DataFrame:
     """
-    (Cached) Aggregates WEEKLY fear scores from text data based on 'week_date',
-    then merges this weekly score onto the WEEKLY mortality data. Creates lagged features.
-    Standardizes the chosen feature and its lag.
-    Returns a weekly DataFrame ready for TFT.
+    (Cached) Aggregates weekly structured trial metrics AND trial-level sentiment scores,
+    applies filtering/smoothing, merges with mortality data, log-transforms deaths,
+    creates lagged features, clips ends, and standardizes.
+    Returns a weekly DataFrame ready for analysis/TFT.
     """
-    logger.info(f"Aggregating WEEKLY sentiment using '{agg_method}' and merging with WEEKLY mortality...")
-    if 'fear_score' not in text_df.columns or 'week_date' not in text_df.columns: raise ValueError("'fear_score','week_date' needed in text_df.")
-    if not all(c in weekly_mortality_df.columns for c in ['week_date', 'year', 'week_of_year', 'deaths']): raise ValueError("mortality_df missing cols.")
+    logger.info(f"Aggregating WEEKLY combined structured & sentiment metrics...")
+    # --- Input Checks ---
+    required_structured_cols = ['week_date', 'trial_id', 'offence_cat', 'verdict_cat', 'punishment_cat']
+    # Dynamically get expected sentiment columns from the sentiment_df input
+    expected_sentiment_cols = ['week_date', 'trial_id'] + [col for col in sentiment_df.columns if col.endswith('_sentiment')]
+    required_mortality_cols = ['week_date', 'year', 'week_of_year', 'deaths']
 
-    text_df_copy = text_df[['week_date', 'fear_score']].copy()
-    text_df_copy['fear_score'] = pd.to_numeric(text_df_copy['fear_score'], errors='coerce')
-    text_df_copy.dropna(subset=['fear_score', 'week_date'], inplace=True)
+    if not all(c in structured_df.columns for c in required_structured_cols):
+         raise ValueError(f"structured_df missing required columns. Need: {required_structured_cols}. Found: {structured_df.columns.tolist()}")
+    if not all(c in sentiment_df.columns for c in expected_sentiment_cols):
+         # Allow proceeding if sentiment_df is empty but has right id cols
+         if not sentiment_df.empty or not all(c in sentiment_df.columns for c in ['week_date', 'trial_id']):
+             raise ValueError(f"sentiment_df missing expected columns. Need: {expected_sentiment_cols}. Found: {sentiment_df.columns.tolist()}")
+         else:
+             logger.warning("Sentiment DataFrame is empty but has identifier columns. Proceeding without sentiment scores.")
+             sentiment_cols_to_agg = [] # No sentiment cols to process
+    else:
+        sentiment_cols_to_agg = [col for col in expected_sentiment_cols if col not in ['week_date', 'trial_id']]
 
-    # --- Aggregate Fear Score by WEEK using chosen method ---
-    weekly_sentiment = pd.DataFrame()
-    feature_col_name = f'fear_score_weekly_{agg_method}'
+    if not all(c in weekly_mortality_df.columns for c in required_mortality_cols):
+        raise ValueError("mortality_df missing required columns.")
 
-    if agg_method == 'mean': weekly_sentiment = text_df_copy.groupby('week_date')['fear_score'].mean().reset_index()
-    elif agg_method == 'max': weekly_sentiment = text_df_copy.groupby('week_date')['fear_score'].max().reset_index()
-    elif agg_method == 'proportion':
-        logger.info(f"Calculating proportion > {fear_thresh}"); text_df_copy['high_fear'] = (text_df_copy['fear_score'] > fear_thresh).astype(int)
-        weekly_sentiment = text_df_copy.groupby('week_date')['high_fear'].mean().reset_index()
-    else: raise ValueError(f"Unsupported agg method: {agg_method}.")
-    weekly_sentiment.rename(columns={weekly_sentiment.columns[1]: feature_col_name}, inplace=True)
-    logger.info(f"Aggregated weekly sentiment ({agg_method}) for {weekly_sentiment.shape[0]} weeks.")
-
-    # --- Merge Weekly Sentiment with Weekly Mortality ---
-    logger.info(f"Merging weekly '{feature_col_name}' with weekly mortality data...")
-    # Ensure 'week_date' is datetime for merging
-    weekly_sentiment['week_date'] = pd.to_datetime(weekly_sentiment['week_date'])
+    # Convert dates
+    structured_df['week_date'] = pd.to_datetime(structured_df['week_date'])
+    sentiment_df['week_date'] = pd.to_datetime(sentiment_df['week_date'])
     weekly_mortality_df['week_date'] = pd.to_datetime(weekly_mortality_df['week_date'])
-    # Perform an OUTER merge to keep all weeks from both datasets
-    merged_df = pd.merge(weekly_mortality_df, weekly_sentiment, on='week_date', how='outer')
-    # Sort by date after merge
+
+    # --- Aggregate Structured Metrics (Filter, Smooth) ---
+    VIOLENT_CATS = ['violenttheft', 'kill', 'sexual']; PROPERTY_CATS = ['theft', 'deception', 'damage', 'royaloffences']
+    GUILTY_VERDICTS = ['guilty']; NOT_GUILTY_VERDICTS = ['notguilty', 'unknown']
+    DEATH_PUNISH = ['death']; TRANSPORT_PUNISH = ['transport']; CORPORAL_PUNISH = ['corporal', 'miscpunish']
+    MIN_TRIALS_PER_WEEK = 3; SMOOTHING_WINDOW = 4
+
+    weekly_counts = structured_df.groupby('week_date').agg(
+        total_trials = ('trial_id', 'nunique'),
+        violent_trials = ('offence_cat', lambda x: x.isin(VIOLENT_CATS).sum()),
+        property_trials = ('offence_cat', lambda x: x.isin(PROPERTY_CATS).sum()),
+        guilty_verdicts = ('verdict_cat', lambda x: x.isin(GUILTY_VERDICTS).sum()),
+        not_guilty_verdicts = ('verdict_cat', lambda x: x.isin(NOT_GUILTY_VERDICTS).sum()),
+        death_sentences = ('punishment_cat', lambda x: x.isin(DEATH_PUNISH).sum()),
+        transport_sentences = ('punishment_cat', lambda x: x.isin(TRANSPORT_PUNISH).sum()),
+        corporal_sentences = ('punishment_cat', lambda x: x.isin(CORPORAL_PUNISH).sum()),
+    ).reset_index()
+
+    def calculate_punishment_score(row):
+        if row['punishment_cat'] in DEATH_PUNISH: return 5
+        if row['punishment_cat'] in TRANSPORT_PUNISH: return 4
+        if row['punishment_cat'] in CORPORAL_PUNISH: return 3
+        return 0
+    structured_df['punish_score'] = structured_df.apply(calculate_punishment_score, axis=1)
+    convicted_df = structured_df[structured_df['verdict_cat'].isin(GUILTY_VERDICTS)]
+    weekly_avg_punish_score = convicted_df.groupby('week_date')['punish_score'].mean().reset_index().rename(columns={'punish_score': 'avg_punishment_score'})
+    weekly_metrics = pd.merge(weekly_counts, weekly_avg_punish_score, on='week_date', how='left')
+
+    metric_cols_calc = ['violent_crime_prop', 'property_crime_prop', 'conviction_rate',
+                        'death_sentence_rate', 'transport_rate', 'avg_punishment_score']
+    for col in metric_cols_calc: weekly_metrics[col] = np.nan
+    valid_week_mask = weekly_metrics['total_trials'] >= MIN_TRIALS_PER_WEEK
+    logger.info(f"Calculating rates/proportions for {valid_week_mask.sum()} weeks with >= {MIN_TRIALS_PER_WEEK} trials.")
+    total_trials_denom_valid = weekly_metrics.loc[valid_week_mask, 'total_trials']
+    guilty_denom_valid = weekly_metrics.loc[valid_week_mask, 'guilty_verdicts'].replace(0, np.nan)
+    valid_verdicts_denom_valid = (weekly_metrics.loc[valid_week_mask, 'guilty_verdicts'] + weekly_metrics.loc[valid_week_mask, 'not_guilty_verdicts']).replace(0, np.nan)
+    weekly_metrics.loc[valid_week_mask, 'violent_crime_prop'] = weekly_metrics['violent_trials'] / total_trials_denom_valid
+    weekly_metrics.loc[valid_week_mask, 'property_crime_prop'] = weekly_metrics['property_trials'] / total_trials_denom_valid
+    weekly_metrics.loc[valid_week_mask, 'conviction_rate'] = weekly_metrics['guilty_verdicts'] / valid_verdicts_denom_valid
+    weekly_metrics.loc[valid_week_mask, 'death_sentence_rate'] = weekly_metrics['death_sentences'] / guilty_denom_valid
+    weekly_metrics.loc[valid_week_mask, 'transport_rate'] = weekly_metrics['transport_sentences'] / guilty_denom_valid
+    weekly_metrics['avg_punishment_score'].fillna(0, inplace=True)
+
+    logger.info("Imputing NaNs created by minimum trial filter (Structured)...")
+    for col in metric_cols_calc:
+        if weekly_metrics[col].isnull().any():
+            weekly_metrics[col] = weekly_metrics[col].fillna(weekly_metrics[col].rolling(SMOOTHING_WINDOW*2, min_periods=1, center=True).median())
+            weekly_metrics[col].fillna(weekly_metrics[col].median(), inplace=True)
+
+    logger.info(f"Applying {SMOOTHING_WINDOW}-week rolling average smoothing (Structured)...")
+    metric_cols_smooth = ['violent_crime_prop', 'property_crime_prop', 'conviction_rate',
+                          'death_sentence_rate', 'transport_rate', 'avg_punishment_score']
+    smoothed_structural_col_names = {}
+    for col in metric_cols_smooth:
+         smooth_col = f"{col}_smooth"
+         smoothed_structural_col_names[col] = smooth_col
+         weekly_metrics[smooth_col] = weekly_metrics[col].rolling(window=SMOOTHING_WINDOW, center=True, min_periods=1).mean()
+         weekly_metrics[smooth_col].fillna(weekly_metrics[col], inplace=True) # Fill NaNs from smoothing
+
+    # --- Aggregate Sentiment Scores (Weekly Mean) ---
+    if sentiment_cols_to_agg: # Check if there are sentiment columns to aggregate
+        logger.info(f"Aggregating weekly sentiment scores (mean) for columns: {sentiment_cols_to_agg}...")
+        weekly_sentiment_aggregated = sentiment_df.groupby('week_date')[sentiment_cols_to_agg].mean().reset_index()
+        logger.info(f"Aggregated weekly sentiment scores for {weekly_sentiment_aggregated.shape[0]} weeks.")
+    else:
+        logger.info("Skipping sentiment aggregation as no sentiment columns were provided or calculated.")
+        weekly_sentiment_aggregated = pd.DataFrame(columns=['week_date']) # Empty df with date col
+
+    # --- Merge All Aggregated Data ---
+    logger.info("Merging aggregated structured metrics and sentiment scores...")
+    structured_to_merge = weekly_metrics[['week_date', 'total_trials'] + list(smoothed_structural_col_names.values())]
+    # Merge structured with sentiment (use outer to keep all weeks)
+    combined_weekly_metrics = pd.merge(structured_to_merge, weekly_sentiment_aggregated, on='week_date', how='outer')
+
+    # --- Merge Combined Metrics with Mortality ---
+    logger.info(f"Merging combined weekly metrics with weekly mortality data...")
+    merged_df = pd.merge(weekly_mortality_df, combined_weekly_metrics, on='week_date', how='outer')
     merged_df = merged_df.sort_values("week_date").reset_index(drop=True)
 
-    # --- Handle Missing Data from Merge ---
-    missing_sentiment = merged_df[feature_col_name].isnull().sum()
+    # --- Handle Missing Data (Post-Merge) & Imputation ---
+    # Define all potential metric columns after merge
+    all_metric_cols_post_merge = (['total_trials'] + list(smoothed_structural_col_names.values()) + sentiment_cols_to_agg)
+    for col in all_metric_cols_post_merge:
+        if col in merged_df.columns: # Check if column exists after merge
+            missing_count = merged_df[col].isnull().sum()
+            if missing_count > 0:
+                logger.warning(f"{missing_count} weeks missing '{col}'. Imputing with rolling median then 0.")
+                merged_df[col] = merged_df[col].fillna(merged_df[col].rolling(4, min_periods=1, center=True).median())
+                merged_df[col].fillna(0, inplace=True) # Fallback fill with 0
+        # No need to log warning if column doesn't exist (e.g., sentiment was skipped)
+
     missing_deaths = merged_df['deaths'].isnull().sum()
-    if missing_sentiment > 0: logger.warning(f"{missing_sentiment} weeks have missing sentiment data. Imputing with rolling median.")
-    if missing_deaths > 0: logger.warning(f"{missing_deaths} weeks have missing mortality data. Imputing with 0 (or consider rolling median).")
+    if missing_deaths > 0: logger.warning(f"{missing_deaths} weeks missing mortality. Imputing 0."); merged_df['deaths'].fillna(0, inplace=True)
+    merged_df['year'] = merged_df['year'].fillna(merged_df['week_date'].dt.isocalendar().year).astype(int)
+    merged_df['week_of_year'] = merged_df['week_of_year'].fillna(merged_df['week_date'].dt.isocalendar().week).astype(int)
 
-    # Impute missing values - use rolling window or interpolation for time series
-    # Rolling median imputation for sentiment
-    merged_df[feature_col_name] = merged_df[feature_col_name].fillna(merged_df[feature_col_name].rolling(4, min_periods=1, center=True).median())
-    merged_df[feature_col_name].fillna(merged_df[feature_col_name].median(), inplace=True) # Fill remaining with global median
+    # --- Log Transform Deaths ---
+    merged_df['log_deaths'] = np.log1p(merged_df['deaths'])
+    logger.info("Applied log1p transformation to 'deaths' column -> 'log_deaths'.")
 
-    # Impute missing deaths (e.g., with 0 or rolling median) - using 0 assumes no report means no deaths (could be wrong)
-    # merged_df['deaths'].fillna(merged_df['deaths'].rolling(4, min_periods=1, center=True).median(), inplace=True)
-    merged_df['deaths'].fillna(0, inplace=True) # Simpler imputation
-    # Fill missing year/week after outer merge
-    merged_df['year'] = merged_df['year'].fillna(merged_df['week_date'].dt.isocalendar().year)
-    merged_df['week_of_year'] = merged_df['week_of_year'].fillna(merged_df['week_date'].dt.isocalendar().week)
+    # --- Create Lagged Features ---
+    # Choose columns to lag (examples: smoothed structured + aggregated sentiment)
+    cols_to_lag = [
+        smoothed_structural_col_names.get('conviction_rate'), # Use .get() for safety
+        'hardship_sentiment' # Example sentiment
+    ]
+    cols_to_lag = [col for col in cols_to_lag if col is not None and col in merged_df.columns] # Filter out None or missing columns
+    lagged_col_names = []
+    for lag_col_name in cols_to_lag:
+        feature_lag_col_name = f'{lag_col_name}_lag{LAG_WEEKS}w'
+        lagged_col_names.append(feature_lag_col_name)
+        logger.info(f"Creating lagged feature: '{feature_lag_col_name}' ({LAG_WEEKS} weeks)...")
+        merged_df[feature_lag_col_name] = merged_df[lag_col_name].shift(LAG_WEEKS)
+        initial_nan_count = merged_df[feature_lag_col_name].isnull().sum()
+        if initial_nan_count > 0:
+            merged_df[feature_lag_col_name] = merged_df[feature_lag_col_name].fillna(merged_df[feature_lag_col_name].rolling(4, min_periods=1, center=True).median())
+            merged_df[feature_lag_col_name].fillna(0, inplace=True)
 
-    # --- Create Lagged Weekly Fear Score ---
-    lag_weeks = 4 # Example: use 4-week lag
-    feature_lag_col_name = f'{feature_col_name}_lag{lag_weeks}w'
-    logger.info(f"Creating lagged feature: '{feature_lag_col_name}' ({lag_weeks} weeks)...")
-    merged_df[feature_lag_col_name] = merged_df[feature_col_name].shift(lag_weeks)
-    initial_nan_count = merged_df[feature_lag_col_name].isnull().sum()
-    if initial_nan_count > 0:
-        logger.info(f"Imputing {initial_nan_count} initial NaNs in lagged fear score (rolling median).")
-        merged_df[feature_lag_col_name] = merged_df[feature_lag_col_name].fillna(merged_df[feature_lag_col_name].rolling(4, min_periods=1, center=True).median())
-        merged_df[feature_lag_col_name].fillna(merged_df[feature_lag_col_name].median(), inplace=True) # Fill remaining
+    # --- Standardize Features ---
+    # Standardize smoothed structured, aggregated sentiment, and their lags
+    features_to_standardize = list(smoothed_structural_col_names.values()) + sentiment_cols_to_agg + lagged_col_names
+    standardized_col_names_map = {}
+    logger.info(f"Attempting to standardize: {features_to_standardize}")
+    for col in features_to_standardize:
+        if col in merged_df.columns:
+             std_col_name = f'{col}_std'
+             standardized_col_names_map[col] = std_col_name
+             logger.info(f"Standardizing '{col}' -> '{std_col_name}'.")
+             scaler = StandardScaler()
+             # Check for NaNs/Infs before scaling
+             if merged_df[[col]].isnull().any().any() or np.isinf(merged_df[[col]]).any().any():
+                 logger.warning(f"NaNs or Infs found in '{col}' before standardization. Imputing with median again.")
+                 col_median = merged_df[col].median()
+                 merged_df[col] = merged_df[col].replace([np.inf, -np.inf], np.nan).fillna(col_median)
+             try:
+                 merged_df[std_col_name] = scaler.fit_transform(merged_df[[col]])
+                 merged_df[std_col_name] = merged_df[std_col_name].astype(float)
+             except ValueError as e:
+                 logger.error(f"StandardScaler failed for column '{col}': {e}. Skipping standardization for this column.")
+                 # Remove from map if failed
+                 if col in standardized_col_names_map: del standardized_col_names_map[col]
+        else: logger.warning(f"Column '{col}' not found for standardization.")
 
-    # --- Standardize the Chosen Fear Scores ---
-    feature_std_col_name = 'feature_std'; feature_lag_std_col_name = 'feature_lag_std'
-    logger.info(f"Standardizing '{feature_col_name}' -> '{feature_std_col_name}' and '{feature_lag_col_name}' -> '{feature_lag_std_col_name}'.")
-    scaler_current = StandardScaler(); merged_df[feature_std_col_name] = scaler_current.fit_transform(merged_df[[feature_col_name]])
-    scaler_lagged = StandardScaler(); merged_df[feature_lag_std_col_name] = scaler_lagged.fit_transform(merged_df[[feature_lag_col_name]])
 
-    # --- Prepare for TFT (Weekly Time Index) ---
+    # --- Prepare Final DataFrame ---
     merged_df = merged_df.sort_values("week_date").reset_index(drop=True)
-    # Time index based on weeks since start
     merged_df["time_idx"] = (merged_df["week_date"] - merged_df["week_date"].min()).dt.days // 7
+
+    # Ensure dtypes before final selection
+    merged_df["log_deaths"] = merged_df["log_deaths"].astype(float)
     merged_df["deaths"] = merged_df["deaths"].astype(float)
-    merged_df[feature_std_col_name] = merged_df[feature_std_col_name].astype(float)
-    merged_df[feature_lag_std_col_name] = merged_df[feature_lag_std_col_name].astype(float)
+    for col in list(smoothed_structural_col_names.values()) + sentiment_cols_to_agg + lagged_col_names:
+        if col in merged_df.columns: merged_df[col] = pd.to_numeric(merged_df[col], errors='coerce').astype(float)
     merged_df["year"] = merged_df["year"].astype(str)
     merged_df["week_of_year"] = merged_df["week_of_year"].astype(str)
     merged_df["series_id"] = "London"
 
-    final_cols = [
-        "week_date", "time_idx", "deaths", "year", "week_of_year", "series_id",
-        feature_col_name, feature_lag_col_name, # Raw scores
-        feature_std_col_name, feature_lag_std_col_name # Standardized scores
-    ]
-    merged_df = merged_df[[col for col in final_cols if col in merged_df.columns]] # Ensure columns exist
+    # Define final columns list carefully
+    final_cols = (
+        ["week_date", "time_idx", "deaths", "log_deaths", "year", "week_of_year", "series_id", "total_trials"] +
+        list(smoothed_structural_col_names.values()) + # Smoothed structured
+        sentiment_cols_to_agg +                 # Aggregated sentiment
+        lagged_col_names +                      # Lagged versions
+        list(standardized_col_names_map.values()) # Standardized versions that were successfully created
+    )
+    # Ensure only unique columns that actually exist are selected
+    final_cols_unique_exist = []
+    for col in final_cols:
+        if col in merged_df.columns and col not in final_cols_unique_exist:
+            final_cols_unique_exist.append(col)
 
-    logger.info(f"Final weekly data shape for TFT: {merged_df.shape}. Time idx range: {merged_df['time_idx'].min()}-{merged_df['time_idx'].max()}")
-    logger.info(f"Columns: {merged_df.columns.tolist()}")
-    nan_check = merged_df.isnull().sum()
-    logger.info(f"NaN check:\n{nan_check[nan_check > 0]}") # Show only columns with NaNs
-    # Drop any remaining rows with NaNs in critical columns (should be few after imputation)
-    critical_cols = ['time_idx', 'deaths', feature_std_col_name, feature_lag_std_col_name]
-    merged_df.dropna(subset=critical_cols, inplace=True)
+    merged_df = merged_df[final_cols_unique_exist].copy()
+
+    logger.info(f"Shape before final NaN drop and clipping: {merged_df.shape}")
+    logger.info(f"Columns before final NaN drop: {merged_df.columns.tolist()}")
+
+    # Define critical columns for NaN drop using the map of standardized names
+    critical_cols_for_model = ['time_idx', 'log_deaths'] + list(standardized_col_names_map.values())
+    critical_cols_for_model_exist = [col for col in critical_cols_for_model if col in merged_df.columns]
+    logger.info(f"Dropping NaNs based on columns: {critical_cols_for_model_exist}")
+    merged_df.dropna(subset=critical_cols_for_model_exist, inplace=True)
     logger.info(f"Shape after final NaN drop: {merged_df.shape}")
 
-    if merged_df["time_idx"].max() < WEEKLY_MAX_ENCODER_LENGTH + WEEKLY_MAX_PREDICTION_LENGTH:
-         raise ValueError(f"Insufficient weekly data span ({merged_df.shape[0]} weeks) for TFT config (enc={WEEKLY_MAX_ENCODER_LENGTH}, pred={WEEKLY_MAX_PREDICTION_LENGTH}).")
-    return merged_df
+    # --- Clip Ends ---
+    if not merged_df.empty:
+        weeks_to_clip = 52
+        min_idx_df = merged_df['time_idx'].min()
+        max_idx_df = merged_df['time_idx'].max()
+        original_rows = len(merged_df)
+        if max_idx_df >= min_idx_df and (max_idx_df - min_idx_df + 1) > 2 * weeks_to_clip :
+            merged_df = merged_df[(merged_df['time_idx'] >= min_idx_df + weeks_to_clip) &
+                                  (merged_df['time_idx'] <= max_idx_df - weeks_to_clip)].copy()
+            logger.info(f"Clipped ends: Removed first/last {weeks_to_clip} weeks. New shape: {merged_df.shape}. ({original_rows - len(merged_df)} rows removed)")
+        else: logger.warning(f"Not enough data span ({max_idx_df - min_idx_df + 1} weeks) to clip {weeks_to_clip} weeks. Skipping clipping.")
 
+        if merged_df.empty:
+            logger.error("DataFrame empty after clipping ends.")
+            return pd.DataFrame(columns=final_cols_unique_exist)
+
+        # Check sufficiency for TFT *after* clipping
+        if merged_df["time_idx"].max() - merged_df["time_idx"].min() + 1 < WEEKLY_MAX_ENCODER_LENGTH + WEEKLY_MAX_PREDICTION_LENGTH:
+             logger.error(f"Insufficient weekly data span ({merged_df.shape[0]} weeks after clipping) for TFT config.")
+             return pd.DataFrame(columns=final_cols_unique_exist)
+    else:
+        logger.error("DataFrame is empty after NaN drop, cannot proceed.")
+        return pd.DataFrame(columns=final_cols_unique_exist)
+
+    logger.info(f"Final weekly combined metrics data shape returned: {merged_df.shape}. Time idx range: {merged_df['time_idx'].min()}-{merged_df['time_idx'].max()}")
+    logger.info(f"Final Columns Returned: {merged_df.columns.tolist()}")
+    nan_check_after = merged_df.isnull().sum()
+    if nan_check_after.any(): logger.warning(f"NaNs still present after final processing:\n{nan_check_after[nan_check_after > 0]}")
+
+    return merged_df
 
 # -----------------------------------------------------------------------------
 # 5. TFT Training and Evaluation (WEEKLY)
 # -----------------------------------------------------------------------------
-# --- MODIFIED TFT Training Function ---
 def train_tft_model(df: pd.DataFrame,
-                    # --- ADD new parameter for feature names ---
-                    time_varying_reals_cols: List[str], #<<< ADD THIS PARAMETER
+                    time_varying_reals_cols: List[str],
+                    run_name: str, # <<< ADDED run_name for logging/checkpoints
                     # --- Keep other parameters ---
-                    max_epochs: int = MAX_EPOCHS,
+                    max_epochs: int = 75, # <<< Increased default max_epochs
                     batch_size: int = BATCH_SIZE,
                     encoder_length: int = WEEKLY_MAX_ENCODER_LENGTH,
                     pred_length: int = WEEKLY_MAX_PREDICTION_LENGTH,
                     lr: float = LEARNING_RATE,
-                    hidden_size: int = HIDDEN_SIZE,
-                    attn_heads: int = ATTENTION_HEAD_SIZE,
+                    hidden_size: int = HIDDEN_SIZE, # Keep complexity same for now
+                    attn_heads: int = ATTENTION_HEAD_SIZE, # Keep complexity same for now
                     dropout: float = DROPOUT,
-                    hidden_cont_size: int = HIDDEN_CONTINUOUS_SIZE,
+                    hidden_cont_size: int = HIDDEN_CONTINUOUS_SIZE, # Keep complexity same for now
                     clip_val: float = GRADIENT_CLIP_VAL) -> Tuple[Optional[TemporalFusionTransformer], Optional[pl.Trainer], Optional[torch.utils.data.DataLoader], Optional[TimeSeriesDataSet]]:
     """
     Trains the Temporal Fusion Transformer model on WEEKLY data using log-transformed deaths
-    and dynamically specified real-valued features.
+    and dynamically specified real-valued features. Logs under a specific run name.
     """
 
+    logger.info(f"--- Starting TFT Training for Run: '{run_name}' ---")
     logger.info(f"Setting up WEEKLY TFT model training (Target: log_deaths)...")
-    # Use the parameter passed to the function
     logger.info(f" Using real features: {time_varying_reals_cols}")
     logger.info(f" Encoder length: {encoder_length} weeks, Prediction length: {pred_length} weeks")
 
@@ -1037,181 +1279,272 @@ def train_tft_model(df: pd.DataFrame,
     logger.info("Ensuring correct dtypes before TimeSeriesDataSet...")
     try:
         data_for_tft = df.copy()
-        # Combine standard numeric cols with the dynamic list
         required_numeric_cols = ["time_idx", "log_deaths", "deaths"] + time_varying_reals_cols
-        required_numeric_cols = list(set(required_numeric_cols)) # Unique columns
-
+        required_numeric_cols = list(set(required_numeric_cols))
         for col in required_numeric_cols:
-            if col not in data_for_tft.columns:
-                # Log missing columns clearly
-                logger.error(f"Column '{col}' specified in features/required list not found in DataFrame columns: {data_for_tft.columns.tolist()}")
-                raise ValueError(f"Column '{col}' not found.")
+            if col not in data_for_tft.columns: raise ValueError(f"Column '{col}' not found.")
             data_for_tft[col] = pd.to_numeric(data_for_tft[col], errors='coerce')
-
         categorical_cols = ["series_id", "week_of_year", "year"]
         for col in categorical_cols: data_for_tft[col] = data_for_tft[col].astype(str)
-
-        # Impute NaNs if any crept in
         numeric_cols_to_impute = [col for col in required_numeric_cols if col != 'time_idx']
         if data_for_tft[numeric_cols_to_impute].isnull().any().any():
              nan_counts = data_for_tft[numeric_cols_to_impute].isnull().sum()
              logger.warning(f"NaNs found after casting:\n{nan_counts[nan_counts > 0]}. Imputing with median.")
-             for col in numeric_cols_to_impute:
-                 data_for_tft[col].fillna(data_for_tft[col].median(), inplace=True)
+             for col in numeric_cols_to_impute: data_for_tft[col].fillna(data_for_tft[col].median(), inplace=True)
         logger.info("Dtype check passed.")
     except Exception as e: logger.error(f"Error during dtype check: {e}", exc_info=True); return None, None, None, None
 
     # --- TimeSeriesDataSet Setup ---
     logger.info("Setting up WEEKLY TimeSeriesDataSet for TFT (Target: log_deaths)...")
     try:
-        # Use the dynamic list here, ensuring target is not duplicated
         unknown_reals_for_tft = [col for col in time_varying_reals_cols if col != "log_deaths"]
         logger.info(f"Passing to TimeSeriesDataSet time_varying_unknown_reals: {unknown_reals_for_tft}")
-
-        # Check if all columns in unknown_reals_for_tft actually exist in the dataframe before creating dataset
         missing_tft_cols = [col for col in unknown_reals_for_tft if col not in data_for_tft.columns]
-        if missing_tft_cols:
-            logger.error(f"Columns specified for TFT `time_varying_unknown_reals` are missing from the dataframe: {missing_tft_cols}")
-            raise ValueError("Missing columns required for TFT dataset.")
+        if missing_tft_cols: raise ValueError(f"Columns for TFT `time_varying_unknown_reals` are missing: {missing_tft_cols}")
 
         training_dataset = TimeSeriesDataSet(
             data_for_tft[lambda x: x.time_idx <= training_cutoff],
-            time_idx="time_idx",
-            target="log_deaths",
-            group_ids=["series_id"],
+            time_idx="time_idx", target="log_deaths", group_ids=["series_id"],
             max_encoder_length=encoder_length, max_prediction_length=pred_length,
             static_categoricals=["series_id"],
             time_varying_known_categoricals=["week_of_year"],
             time_varying_known_reals=["time_idx"],
             time_varying_unknown_categoricals=["year"],
-            # Use the filtered dynamic list
             time_varying_unknown_reals=unknown_reals_for_tft,
             add_target_scales=True, add_encoder_length=True, allow_missing_timesteps=True,
             categorical_encoders={"year": NaNLabelEncoder(add_nan=True), "week_of_year": NaNLabelEncoder(add_nan=True)}
         )
-
-        # --- Dataloader and Model Training ---
         validation_dataset = TimeSeriesDataSet.from_dataset(training_dataset, data_for_tft, predict=True, stop_randomization=True)
+
         effective_batch_size = max(1, min(batch_size, len(training_dataset) // 2 if len(training_dataset) > 1 else 1))
-        logger.info(f"Using effective batch size: {effective_batch_size}")
-        train_dataloader = training_dataset.to_dataloader(train=True, batch_size=effective_batch_size, num_workers=0, persistent_workers=False, pin_memory=(DEVICE.type == 'cuda'))
-        val_dataloader = validation_dataset.to_dataloader(train=False, batch_size=effective_batch_size * 2, num_workers=0, persistent_workers=False, pin_memory=(DEVICE.type == 'cuda'))
+        # Ensure validation batch size isn't larger than the validation dataset size
+        # Calculate size of validation part of data_for_tft
+        val_data_len = len(data_for_tft[lambda x: x.time_idx > training_cutoff])
+        # A simple estimate for validation samples (can be complex due to sequence overlaps)
+        # A safer bet is often to use a smaller batch size for validation if unsure
+        val_batch_size = max(1, min(effective_batch_size * 2, val_data_len // pred_length if pred_length > 0 else val_data_len))
+        logger.info(f"Using effective train batch size: {effective_batch_size}, val batch size: {val_batch_size}")
+
+
+        train_dataloader = training_dataset.to_dataloader(train=True, batch_size=effective_batch_size, num_workers=0, persistent_workers=False)
+        # Ensure shuffle=False for validation loader
+        val_dataloader = validation_dataset.to_dataloader(train=False, batch_size=val_batch_size, num_workers=0, persistent_workers=False, shuffle=False)
+
         if len(train_dataloader) == 0 or len(val_dataloader) == 0: logger.error("Empty dataloader(s)."); return None, None, None, None
-    except Exception as e:
-        logger.error(f"Error creating TimeSeriesDataSet/Dataloaders: {e}", exc_info=True); logger.error(f"Data info:\n{data_for_tft.info()}"); return None, None, None, None
+    except Exception as e: logger.error(f"Error creating TimeSeriesDataSet/Dataloaders: {e}", exc_info=True); logger.error(f"Data info:\n{data_for_tft.info()}"); return None, None, None, None
 
     logger.info("Configuring TemporalFusionTransformer model...")
     loss_metric = QuantileLoss(quantiles=[0.1, 0.5, 0.9])
     try:
         tft = TemporalFusionTransformer.from_dataset(
             training_dataset, learning_rate=lr, hidden_size=hidden_size, attention_head_size=attn_heads,
-            dropout=dropout, hidden_continuous_size=hidden_cont_size, loss=loss_metric, log_interval=50,
+            dropout=dropout, hidden_continuous_size=hidden_cont_size, loss=loss_metric, log_interval=10, # Log slightly more often
             optimizer="adam", reduce_on_plateau_patience=5,
         )
         logger.info(f"TFT model parameters: {tft.size()/1e6:.1f} million")
     except Exception as e: logger.error(f"Error initializing TFT: {e}", exc_info=True); return None, None, val_dataloader, validation_dataset
 
-    early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=10, verbose=True, mode="min")
+    # --- Use run_name for logger ---
+    early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=1e-4, patience=8, verbose=True, mode="min") # <<< Increased patience
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
     accelerator, devices = ('cpu', 1)
     logger.info(f"Configuring Trainer (Accelerator: {accelerator}, Devices: {devices})...")
     from pytorch_lightning.loggers import TensorBoardLogger
-    # Updated logger name for combined metrics
-    tb_logger = TensorBoardLogger(save_dir="lightning_logs/", name="tft_combined_metrics_weekly_log_target")
-    trainer = pl.Trainer(max_epochs=max_epochs, accelerator=accelerator, devices=devices, gradient_clip_val=clip_val, callbacks=[lr_monitor, early_stop_callback], logger=tb_logger, enable_progress_bar=True)
+    # Use run_name to create distinct log directories
+    tb_logger = TensorBoardLogger(save_dir="lightning_logs/", name=f"tft_{run_name}_weekly_log_target")
+    trainer = pl.Trainer(
+        max_epochs=max_epochs, # Use increased max_epochs from args
+        accelerator=accelerator,
+        devices=devices,
+        gradient_clip_val=clip_val,
+        callbacks=[lr_monitor, early_stop_callback],
+        logger=tb_logger,
+        enable_progress_bar=True
+    )
 
-    logger.info("Starting TFT model training (Weekly, Target: log_deaths, Features: Combined Metrics)...")
+    logger.info(f"Starting TFT model training for run '{run_name}'...")
     start_train_time = time.time()
+    best_tft = None # Initialize best_tft
     try:
         trainer.fit(tft, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
-        logger.info(f"TFT training finished in {(time.time() - start_train_time)/60:.2f} minutes.")
-        best_model_path = trainer.checkpoint_callback.best_model_path if trainer.checkpoint_callback else None
+        logger.info(f"TFT training finished for '{run_name}' in {(time.time() - start_train_time)/60:.2f} minutes.")
+        best_model_path = trainer.checkpoint_callback.best_model_path if hasattr(trainer, "checkpoint_callback") and trainer.checkpoint_callback else None
+
         if best_model_path and os.path.exists(best_model_path):
-            logger.info(f"Loading best model from checkpoint: {best_model_path}")
+            logger.info(f"Loading best model for '{run_name}' from checkpoint: {best_model_path}")
+            # Load onto the globally defined DEVICE
             best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path, map_location=DEVICE)
+            logger.info(f"Best model loaded successfully for run '{run_name}'.")
             return best_tft, trainer, val_dataloader, validation_dataset
         else:
-            logger.warning("Best checkpoint not found/saved.")
-            last_model = trainer.model if hasattr(trainer, 'model') else tft
-            if last_model: last_model.to(DEVICE)
-            return last_model, trainer, val_dataloader, validation_dataset # Return last model state if no checkpoint
+            logger.warning(f"Best checkpoint not found or invalid path for '{run_name}'. Attempting to return last model state.")
+            # Try to get the last model state from the trainer
+            last_model = trainer.model if hasattr(trainer, 'model') and trainer.model is not None else tft
+            if last_model:
+                 last_model.to(DEVICE) # Ensure it's on the correct device
+                 logger.info(f"Returning last model state for run '{run_name}'.")
+                 return last_model, trainer, val_dataloader, validation_dataset
+            else:
+                 logger.error(f"Could not retrieve last model state for run '{run_name}'.")
+                 return None, trainer, val_dataloader, validation_dataset
+
     except Exception as e:
-        logger.error(f"Error during TFT fitting: {e}", exc_info=True)
-        last_model = trainer.model if hasattr(trainer, 'model') else tft # Try to return model even if fit fails
+        logger.error(f"Error during TFT fitting for run '{run_name}': {e}", exc_info=True)
+        # Attempt to return last model state even on error
+        last_model = trainer.model if hasattr(trainer, 'model') and trainer.model is not None else tft
         if last_model: last_model.to(DEVICE)
         return last_model, trainer, val_dataloader, validation_dataset
 
-# --- evaluate_model function (UPDATED FOR WEEKLY & LOG TRANSFORM) ---
-def evaluate_model(model: TemporalFusionTransformer, dataloader: torch.utils.data.DataLoader, dataset: TimeSeriesDataSet, plot_dir: str) -> Dict[str, float]:
-    """Evaluates TFT model on log_deaths, returns metrics on original death scale, saves plots."""
-    logger.info("Evaluating model performance on validation set (Weekly, Target: log_deaths)...")
+# --- evaluate_model function (Correct for Forecasting Task) ---
+# Ensure these imports are present at the top of your script
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
+from pytorch_forecasting.metrics import MAE, SMAPE, QuantileLoss # Or specific metric classes used
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import logging
+import os
+import torch
+
+# Make sure DEVICE is defined globally (e.g., DEVICE = torch.device("cpu"))
+# Make sure logger is defined globally (e.g., logger = logging.getLogger(__name__))
+
+# --- evaluate_model function (Correct for Forecasting Task - Revised Unpacking) ---
+def evaluate_model(model: TemporalFusionTransformer, dataloader: torch.utils.data.DataLoader,
+                   dataset: TimeSeriesDataSet, plot_dir: str, run_name: str) -> Dict[str, float]:
+    """
+    Evaluates TFT model on log_deaths, returns metrics (MAE, MSE, SMAPE) on original death scale,
+    saves plots with run_name prefix, and acknowledges confidence-based metrics.
+    Includes revised predict() output handling.
+    """
+    logger.info(f"Evaluating model performance for run '{run_name}'...")
     results = {}
-    if model is None or dataloader is None or len(dataloader) == 0: logger.error("Model/Dataloader missing for eval."); return {"MAE": np.nan, "MSE": np.nan, "SMAPE": np.nan}
-    try: eval_device = next(model.parameters()).device
-    except Exception: eval_device = torch.device(DEVICE); model.to(eval_device)
+    if model is None or dataloader is None or len(dataloader) == 0:
+        logger.error("Model/Dataloader missing for evaluation.")
+        return {"MAE": np.nan, "MSE": np.nan, "SMAPE": np.nan}
+
+    try:
+        eval_device = next(model.parameters()).device
+    except Exception:
+        eval_device = torch.device(DEVICE) # Fallback to global DEVICE
+        try:
+            model.to(eval_device)
+        except Exception as device_err:
+            logger.error(f"Could not move model to device {eval_device}: {device_err}")
+            eval_device = torch.device("cpu") # Force CPU if move fails
+            model.to(eval_device)
+            logger.warning("Forcing evaluation on CPU.")
     logger.info(f"Evaluation device: {eval_device}")
 
-    actuals_log_list, preds_log_list = [], [] # Store log-scale values from model
+    actuals_log_list, preds_log_list = [], []
     with torch.no_grad():
-        for x, y in iter(dataloader):
-            x = {k: v.to(eval_device) for k, v in x.items() if isinstance(v, torch.Tensor)}
-            target_log = y[0].to(eval_device) # y[0] is log_deaths
-            preds = model(x)["prediction"] # Predictions are also on log_deaths scale
-            preds_log_list.append(preds.cpu()) # Store full prediction tensor (p10, p50, p90)
-            actuals_log_list.append(target_log.cpu())
+        for i, (x, y) in enumerate(iter(dataloader)):
+            try:
+                x_gpu = {k: v.to(eval_device) for k, v in x.items() if isinstance(v, torch.Tensor)}
+                target_log = y[0].to(eval_device)
+                preds = model(x_gpu)["prediction"] # Get predictions from model forward pass
+                preds_log_list.append(preds.cpu())
+                actuals_log_list.append(target_log.cpu())
+            except Exception as batch_err:
+                 logger.error(f"Error processing evaluation batch {i}: {batch_err}", exc_info=True)
+                 continue # Skip problematic batch
 
-    if not preds_log_list: logger.error("No predictions collected."); return {"MAE": np.nan, "MSE": np.nan, "SMAPE": np.nan}
+    if not preds_log_list:
+        logger.error("No predictions collected during evaluation.")
+        return {"MAE": np.nan, "MSE": np.nan, "SMAPE": np.nan}
 
-    # Concatenate tensors (keep quantiles for now)
-    actuals_log_all = torch.cat(actuals_log_list).numpy() # Shape: (n_samples, pred_length)
-    preds_log_all = torch.cat(preds_log_list).numpy()    # Shape: (n_samples, pred_length, n_quantiles)
-
-    # Use median prediction (index 1) and flatten for metrics
-    actuals_log_flat = actuals_log_all.flatten()
-    preds_log_median_flat = preds_log_all[:, :, 1].flatten() # Index 1 corresponds to 0.5 quantile (median)
-
-    min_len_m = min(len(actuals_log_flat), len(preds_log_median_flat))
-    if len(actuals_log_flat) != len(preds_log_median_flat):
-        logger.warning(f"Metric length mismatch: Truncate.");
-        preds_log_median_flat=preds_log_median_flat[:min_len_m]
-        actuals_log_flat=actuals_log_flat[:min_len_m]
-
-    # *** Inverse transform to original death scale for MAE/MSE ***
-    actuals_orig_flat = np.expm1(actuals_log_flat)
-    preds_orig_median_flat = np.expm1(preds_log_median_flat)
-    # Ensure non-negative predictions after inverse transform
-    preds_orig_median_flat = np.maximum(0, preds_orig_median_flat)
-
-    # Calculate metrics on original scale
-    val_mae = mean_absolute_error(actuals_orig_flat, preds_orig_median_flat)
-    val_mse = mean_squared_error(actuals_orig_flat, preds_orig_median_flat)
-    # SMAPE can be calculated on original or log scale (less sensitive to scale) - let's use original
-    denominator = (np.abs(actuals_orig_flat) + np.abs(preds_orig_median_flat)) / 2.0
-    val_smape = np.mean(np.abs(preds_orig_median_flat - actuals_orig_flat) / np.where(denominator == 0, 1, denominator)) * 100
-    results = {"MAE": val_mae, "MSE": val_mse, "SMAPE": val_smape}
-    logger.info(f"[Validation Metrics (Original Scale)] MAE={val_mae:.3f} MSE={val_mse:.3f} SMAPE={val_smape:.3f}%")
-
-    # --- Plotting Section (Using predict for aligned data, show ORIGINAL scale) ---
-    logger.info("Generating weekly evaluation plots (showing original death scale)...")
+    # --- Metric Calculation ---
     try:
-        # We need the original 'deaths' corresponding to the log_deaths target for plotting actuals
-        # Get predictions and raw data using predict
-        prediction_output = model.predict(dataloader, mode="raw", return_x=True, return_index=True)
-        preds_dict = None; x_dict = None; index_df = None
-        if isinstance(prediction_output, (list, tuple)) and len(prediction_output) >= 1:
-            if isinstance(prediction_output[0], dict): preds_dict = prediction_output[0] # Contains 'prediction' on log scale
-            if len(prediction_output) > 1 and isinstance(prediction_output[1], dict): x_dict = prediction_output[1] # Contains inputs like 'decoder_target' (log_deaths)
-            if len(prediction_output) > 2 and isinstance(prediction_output[2], pd.DataFrame): index_df = prediction_output[2] # Contains 'time_idx'
-        elif isinstance(prediction_output, dict): preds_dict = prediction_output # Less common return format now
-        if preds_dict is None or x_dict is None or index_df is None: logger.error(f"Predict unpack fail. Skip plots."); return results
+        actuals_log_all = torch.cat(actuals_log_list).numpy()
+        preds_log_all = torch.cat(preds_log_list).numpy()
 
-        # Predictions are log scale
-        preds_log_tensor = preds_dict['prediction'].cpu() # Shape: (n_samples, pred_length, n_quantiles)
+        actuals_log_flat = actuals_log_all.flatten()
+        # Ensure preds_log_all has the expected 3 dimensions (batch, time, quantiles)
+        if preds_log_all.ndim != 3 or preds_log_all.shape[2] != 3:
+             logger.error(f"Prediction tensor has unexpected shape: {preds_log_all.shape}. Expected (..., 3). Cannot calculate metrics.")
+             return {"MAE": np.nan, "MSE": np.nan, "SMAPE": np.nan}
+        preds_log_median_flat = preds_log_all[:, :, 1].flatten() # Use median (p50) - index 1
 
-        # Get ACTUAL log_deaths used by the model during prediction
-        actuals_log_tensor = x_dict['decoder_target'].cpu() # Shape: (n_samples, pred_length)
+        min_len_m = min(len(actuals_log_flat), len(preds_log_median_flat))
+        if len(actuals_log_flat) != len(preds_log_median_flat):
+            logger.warning(f"Metric length mismatch ({len(actuals_log_flat)} vs {len(preds_log_median_flat)}): Truncating.")
+            preds_log_median_flat = preds_log_median_flat[:min_len_m]
+            actuals_log_flat = actuals_log_flat[:min_len_m]
 
-        # Extract time_idx
+        # Inverse transform to original scale
+        actuals_orig_flat = np.expm1(actuals_log_flat)
+        preds_orig_median_flat = np.maximum(0, np.expm1(preds_log_median_flat)) # Ensure non-negative
+
+        val_mae = mean_absolute_error(actuals_orig_flat, preds_orig_median_flat)
+        val_mse = mean_squared_error(actuals_orig_flat, preds_orig_median_flat)
+
+        # Calculate SMAPE carefully, avoiding division by zero
+        denominator = (np.abs(actuals_orig_flat) + np.abs(preds_orig_median_flat)) / 2.0
+        # Handle cases where both actual and prediction are near zero
+        smape_mask = denominator > 1e-9 # Use a small threshold instead of exact zero
+        val_smape = np.mean(
+            np.abs(preds_orig_median_flat[smape_mask] - actuals_orig_flat[smape_mask]) /
+            denominator[smape_mask]
+            ) * 100 if np.any(smape_mask) else 0.0 # Return 0 if all denominators are zero
+
+        results = {"MAE": val_mae, "MSE": val_mse, "SMAPE": val_smape}
+        logger.info(f"[Validation Metrics ({run_name}, Original Scale)] MAE={val_mae:.3f} MSE={val_mse:.3f} SMAPE={val_smape:.3f}%")
+        logger.info("Note: While standard forecasting metrics (MAE, MSE, SMAPE) are reported, evaluating nuanced historical sentiment ideally involves confidence-based metrics like cPrecision/cRecall (Yacouby & Axman, 2020), which were beyond the scope of direct implementation for this forecasting task.")
+
+    except Exception as metric_err:
+        logger.error(f"Error calculating evaluation metrics: {metric_err}", exc_info=True)
+        results = {"MAE": np.nan, "MSE": np.nan, "SMAPE": np.nan} # Ensure results dict exists
+
+    logger.info(f"Generating weekly evaluation plots for run '{run_name}' (showing original death scale)...")
+    plot_fig = None; plot_fig_res = None
+    try:
+        # --- Simplest predict call for plotting data ---
+        # This should return quantiles by default, along with x and index
+        logger.info("Calling model.predict() for plotting...")
+        predictions = model.predict(dataloader, return_x=True, return_index=True)
+        logger.info(f"model.predict() output type: {type(predictions)}")
+        # --- End Simplification ---
+
+        # --- Direct Unpacking Attempt ---
+        if not (isinstance(predictions, (list, tuple)) and len(predictions) == 3):
+             # Check if it's a dict (less common direct return)
+             if isinstance(predictions, dict) and 'prediction' in predictions and 'x' in predictions and 'index' in predictions:
+                 logger.warning("Predict returned a dict, unpacking components.")
+                 raw_preds_container = predictions
+                 x_output = predictions['x']
+                 index_df = predictions['index']
+                 # Need to extract the prediction tensor itself if mode was raw/prediction
+                 if 'prediction' in raw_preds_container:
+                     raw_preds = raw_preds_container['prediction']
+                 else:
+                     logger.error("Prediction tensor missing in returned dict. Skipping plots.")
+                     return results
+             else:
+                 logger.error(f"Predict output did not return expected tuple/list of 3 or usable dict. Got {type(predictions)}. Skipping plots.")
+                 return results # Return metrics calculated earlier
+        else:
+            # Standard tuple/list unpacking
+            raw_preds, x_output, index_df = predictions # Unpack directly
+
+        # Validate components (more detailed checks)
+        # Check raw_preds: should be tensor [samples, time, quantiles] for mode=quantiles (default)
+        if not isinstance(raw_preds, torch.Tensor) or raw_preds.ndim != 3 or raw_preds.shape[2] != 3:
+            logger.error(f"Unpacked prediction component is not a valid quantile tensor. Shape: {raw_preds.shape if isinstance(raw_preds, torch.Tensor) else type(raw_preds)}. Skipping plots.")
+            return results
+        # Check x_output
+        if not isinstance(x_output, dict) or 'decoder_target' not in x_output:
+             logger.error(f"Unpacked x_output is not a dict or missing 'decoder_target'. Type: {type(x_output)}. Skipping plots.")
+             return results
+        # Check index_df
+        if not isinstance(index_df, pd.DataFrame) or 'time_idx' not in index_df.columns:
+             logger.error(f"Unpacked index_df is not a DataFrame or missing 'time_idx'. Type: {type(index_df)}. Skipping plots.")
+             return results
+        # --- End Validation ---
+
+        # Proceed with plotting
+        preds_log_tensor = raw_preds.cpu()
+        actuals_log_tensor = x_output['decoder_target'].cpu()
         time_idx_flat = index_df['time_idx'].values
 
         # Flatten log predictions (p10, p50, p90)
@@ -1220,16 +1553,16 @@ def evaluate_model(model: TemporalFusionTransformer, dataloader: torch.utils.dat
         preds_log_p90_flat = preds_log_tensor[:, :, 2].flatten().numpy()
         actuals_log_flat_plot = actuals_log_tensor.flatten().numpy()
 
-        # Check lengths
+        # Check lengths and truncate if necessary
         n_preds = len(preds_log_p50_flat); n_actuals = len(actuals_log_flat_plot); n_time = len(time_idx_flat)
-        logger.debug(f"Plot shapes - Preds: {n_preds}, Actuals: {n_actuals}, Time: {n_time}")
         if not (n_preds == n_actuals == n_time):
-            logger.warning(f"Plot length mismatch! Truncate."); min_len_plot = min(n_preds, n_actuals, n_time)
-            if min_len_plot == 0: logger.error("Zero length plot data. Skip plots."); return results
+            min_len_plot = min(n_preds, n_actuals, n_time)
+            if min_len_plot == 0: logger.error("Zero length plot data."); return results
+            logger.warning(f"Plot length mismatch ({n_preds} vs {n_actuals} vs {n_time}): Truncating.")
             preds_log_p10_flat=preds_log_p10_flat[:min_len_plot]; preds_log_p50_flat=preds_log_p50_flat[:min_len_plot]; preds_log_p90_flat=preds_log_p90_flat[:min_len_plot]
             actuals_log_flat_plot=actuals_log_flat_plot[:min_len_plot]; time_idx_flat=time_idx_flat[:min_len_plot]
 
-        # *** Inverse transform ACTUALS and PREDICTIONS for plotting ***
+        # Inverse transform ACTUALS and PREDICTIONS for plotting
         actuals_orig_flat_plot = np.expm1(actuals_log_flat_plot)
         p10_orig_flat = np.maximum(0, np.expm1(preds_log_p10_flat))
         p50_orig_flat = np.maximum(0, np.expm1(preds_log_p50_flat))
@@ -1237,49 +1570,135 @@ def evaluate_model(model: TemporalFusionTransformer, dataloader: torch.utils.dat
 
         # Sort by time_idx for plotting
         sort_indices = np.argsort(time_idx_flat)
-        time_idx_sorted=time_idx_flat[sort_indices]
-        actuals_sorted=actuals_orig_flat_plot[sort_indices] # Plot original scale actuals
+        time_idx_sorted=time_idx_flat[sort_indices]; actuals_sorted=actuals_orig_flat_plot[sort_indices]
         p10_sorted=p10_orig_flat[sort_indices]; p50_sorted=p50_orig_flat[sort_indices]; p90_sorted=p90_orig_flat[sort_indices]
 
-        # --- Generate Plots (Original Scale) ---
-        try: start_date_dt = dataset.data["raw"]["week_date"].min(); x_label = f"Time Index (Weeks since {start_date_dt:%Y-%m-%d})"
-        except Exception: x_label = "Time Index (Weeks)"
+        # --- Generate Forecast Plot ---
+        plot_fig, ax = plt.subplots(figsize=(18, 7)) # Wider plot
+        ax.plot(time_idx_sorted, actuals_sorted, label="Actual Deaths", marker='.', linestyle='-', alpha=0.7, color='black', markersize=3, linewidth=0.8)
+        ax.plot(time_idx_sorted, p50_sorted, label="Predicted Median (p50)", linestyle='--', alpha=0.9, color='tab:orange', linewidth=1.2)
+        ax.fill_between(time_idx_sorted, p10_sorted, p90_sorted, color='tab:orange', alpha=0.3, label='p10-p90 Quantiles')
+        plot_title = f"TFT Forecast vs Actuals ({run_name})\nMAE={val_mae:.2f}, SMAPE={val_smape:.2f}%"
+        ax.set_title(plot_title, fontsize=14)
+        try:
+             # Attempt to get start date from dataset's raw data for better label
+             start_date_dt = pd.to_datetime(dataset.data["raw"]["week_date"].iloc[time_idx_sorted[0]])
+             x_label = f"Time Index (Weeks since {start_date_dt:%Y-%m-%d})"
+        except Exception:
+             x_label = "Time Index (Weeks)" # Fallback label
+        ax.set_xlabel(x_label, fontsize=12)
+        ax.set_ylabel("Weekly Deaths (Original Scale)", fontsize=12)
+        ax.legend(fontsize=10); ax.grid(True, linestyle=':', alpha=0.7); plt.tight_layout()
+        plot_file = os.path.join(plot_dir, f"tft_val_forecast_{run_name}_original_scale.png")
+        plt.savefig(plot_file); logger.info(f"Saved forecast plot for '{run_name}' to {plot_file}");
+        plt.close(plot_fig) # Close this specific figure
 
-        plt.figure(figsize=(15, 7))
-        plt.plot(time_idx_sorted, actuals_sorted, label="Actual Deaths", marker='.', linestyle='-', alpha=0.7, color='black', markersize=3, linewidth=0.8)
-        plt.plot(time_idx_sorted, p50_sorted, label="Predicted Median (p50)", linestyle='--', alpha=0.9, color='tab:orange', linewidth=1.2)
-        plt.fill_between(time_idx_sorted, p10_sorted, p90_sorted, color='tab:orange', alpha=0.3, label='p10-p90 Quantiles')
-        plt.title(f"TFT Aggregated Forecast vs Actuals (Validation Set - Weekly, Original Scale)\nMAE={val_mae:.2f}, SMAPE={val_smape:.2f}%", fontsize=14)
-        plt.xlabel(x_label, fontsize=12); plt.ylabel("Weekly Deaths (Original Scale)", fontsize=12) # Updated label
-        plt.legend(fontsize=10); plt.grid(True, linestyle=':', alpha=0.7); plt.tight_layout()
-        plot_file = os.path.join(plot_dir, "tft_val_forecast_aggregated_weekly_original_scale.png"); plt.savefig(plot_file); logger.info(f"Saved aggregated forecast plot to {plot_file}"); plt.close()
-
-        # Residual Plot (on original scale)
+        # --- Residual Plot ---
         residuals = actuals_sorted - p50_sorted
-        plt.figure(figsize=(10, 6)); plt.scatter(p50_sorted, residuals, alpha=0.3, s=15, color='tab:blue', edgecolors='k', linewidth=0.5)
-        plt.axhline(0, color='red', linestyle='--', linewidth=1); plt.title('Residual Plot (Actuals - Median Predictions, Original Scale)', fontsize=14)
-        plt.xlabel('Predicted Median Deaths (Original Scale)', fontsize=12); plt.ylabel('Residuals (Original Scale)', fontsize=12); plt.grid(True, linestyle=':', alpha=0.7); plt.tight_layout()
-        save_path_res = os.path.join(plot_dir, "residuals_weekly_original_scale_plot.png"); plt.savefig(save_path_res); logger.info(f"Saved residual plot to {save_path_res}"); plt.close()
+        plot_fig_res, ax_res = plt.subplots(figsize=(10, 6))
+        ax_res.scatter(p50_sorted, residuals, alpha=0.3, s=15, color='tab:blue', edgecolors='k', linewidth=0.5)
+        ax_res.axhline(0, color='red', linestyle='--', linewidth=1)
+        ax_res.set_title(f'Residual Plot ({run_name}, Original Scale)', fontsize=14)
+        ax_res.set_xlabel('Predicted Median Deaths (Original Scale)', fontsize=12)
+        ax_res.set_ylabel('Residuals (Original Scale)', fontsize=12)
+        ax_res.grid(True, linestyle=':', alpha=0.7); plt.tight_layout()
+        save_path_res = os.path.join(plot_dir, f"residuals_{run_name}_original_scale_plot.png")
+        plt.savefig(save_path_res); logger.info(f"Saved residual plot for '{run_name}' to {save_path_res}");
+        plt.close(plot_fig_res) # Close this specific figure
 
-    except Exception as e: logger.warning(f"Evaluation plotting failed: {e}", exc_info=True)
-    finally: plt.close('all')
+    except Exception as e:
+        logger.warning(f"Evaluation plotting failed: {e}", exc_info=True)
+    finally:
+        # Attempt to close any figures that might still be open
+        if 'plot_fig' in locals() and plot_fig is not None and plt.fignum_exists(plot_fig.number): plt.close(plot_fig)
+        if 'plot_fig_res' in locals() and plot_fig_res is not None and plt.fignum_exists(plot_fig_res.number): plt.close(plot_fig_res)
+        plt.close('all') # General cleanup
+
     return results
 
 # -----------------------------------------------------------------------------
 # 6. Enhanced Plotting Functions (UPDATED FOR WEEKLY)
 # -----------------------------------------------------------------------------
-def plot_time_series(df: pd.DataFrame, time_col: str, value_col: str, title: str, ylabel: str, filename: str, plot_dir: str):
-    """Plots a simple time series using a specified time column (weekly focus)."""
+# (Make sure plt is imported: import matplotlib.pyplot as plt)
+
+def plot_time_series(df: pd.DataFrame, time_col: str, value_col: str, title: str,
+                     ylabel: str, filename: str, plot_dir: str,
+                     zoom_ylim: Optional[Tuple[float, float]] = None,
+                     mark_zero_threshold: float = 0.01):
+    """
+    Plots a simple time series, optionally zooming the y-axis and marking near-zero points.
+
+    Args:
+        df: DataFrame containing the data.
+        time_col: Name of the column for the x-axis (e.g., 'week_date').
+        value_col: Name of the column for the y-axis.
+        title: Plot title.
+        ylabel: Y-axis label.
+        filename: Name for the saved plot file.
+        plot_dir: Directory to save the plot.
+        zoom_ylim: Optional tuple (min_y, max_y) to set y-axis limits.
+        mark_zero_threshold: If zoom_ylim is set, mark points below this threshold.
+    """
     logger.info(f"Generating plot: {title}")
-    if time_col not in df.columns or value_col not in df.columns: logger.error(f"Plot fail '{filename}': Missing cols."); return
+    if time_col not in df.columns or value_col not in df.columns:
+        logger.error(f"Plot fail '{filename}': Missing columns '{time_col}' or '{value_col}'.")
+        return
+    if df.empty:
+        logger.warning(f"DataFrame empty for plot '{filename}'. Skipping.")
+        return
+
     try:
-        plt.figure(figsize=(18, 6)) # Wider plot for weekly data
-        plt.plot(df[time_col], df[value_col], marker='.', linestyle='-', markersize=1.5, alpha=0.6, linewidth=0.8) # Smaller markers, thinner line
-        plt.title(title, fontsize=14); plt.xlabel(time_col.replace('_', ' ').title(), fontsize=12); plt.ylabel(ylabel, fontsize=12)
-        plt.grid(True, linestyle=':', alpha=0.6); plt.tight_layout()
-        plt.savefig(os.path.join(plot_dir, filename)); logger.info(f"Saved plot: {filename}")
-    except Exception as e: logger.error(f"Plot fail {filename}: {e}", exc_info=True)
-    finally: plt.close()
+        fig, ax = plt.subplots(figsize=(18, 6)) # Wider plot for weekly data
+
+        # Plot the main series
+        ax.plot(df[time_col], df[value_col], marker='.', linestyle='-',
+                markersize=1.5, alpha=0.6, linewidth=0.8, label=ylabel)
+
+        ax.set_title(title, fontsize=14)
+        ax.set_xlabel(time_col.replace('_', ' ').title(), fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.grid(True, linestyle=':', alpha=0.6)
+
+        # Handle y-axis zoom and zero marking
+        if zoom_ylim is not None:
+            try:
+                min_y, max_y = zoom_ylim
+                # Find points below the threshold
+                zero_mask = df[value_col] < mark_zero_threshold
+                if zero_mask.any():
+                    # Plot markers for zero/near-zero points just below the zoomed area
+                    # Adjust marker_y_pos if min_y can be negative
+                    marker_y_pos = min_y - (max_y - min_y) * 0.02 # Position slightly below min_y
+                    ax.plot(df.loc[zero_mask, time_col],
+                            [marker_y_pos] * zero_mask.sum(),
+                            marker='|', linestyle='None', markersize=5, color='red', alpha=0.5,
+                            label=f'< {mark_zero_threshold:.2f} threshold')
+                    ax.legend() # Show legend including the threshold markers
+
+                logger.info(f"Applying y-axis zoom: {zoom_ylim}")
+                ax.set_ylim(zoom_ylim)
+            except Exception as e:
+                logger.error(f"Failed to apply zoom/mark zeros for '{filename}': {e}")
+                # Fallback to default y-limits if zoom fails
+                pass # Let matplotlib auto-scale
+
+        plt.tight_layout()
+        # Add rotation for dates if time_col is week_date
+        if pd.api.types.is_datetime64_any_dtype(df[time_col]):
+             fig.autofmt_xdate(rotation=45, ha='right')
+
+        save_path = os.path.join(plot_dir, filename)
+        plt.savefig(save_path)
+        logger.info(f"Saved plot: {save_path}")
+
+    except Exception as e:
+        logger.error(f"Plot fail '{filename}': {e}", exc_info=True)
+    finally:
+        # Ensure figure is closed
+        if 'fig' in locals() and plt.fignum_exists(fig.number):
+            plt.close(fig)
+        else:
+            plt.close() # Close the current figure implicitly created
 
 def plot_dual_axis(df: pd.DataFrame, time_col: str, col1: str, col2: str, label1: str, label2: str, title: str, filename: str, plot_dir: str):
     """Plots two time series on a dual-axis chart (weekly focus)."""
@@ -1331,46 +1750,466 @@ def plot_weekly_boxplot(df: pd.DataFrame, column: str, title: str, filename: str
     finally: plt.close()
 
 
+def plot_sentiment_with_rolling_stats(df: pd.DataFrame, time_col: str, value_col: str,
+                                      window: int, title: str, ylabel: str,
+                                      filename: str, plot_dir: str):
+    """
+    Plots a sentiment time series along with its rolling mean and rolling standard deviation.
+
+    Args:
+        df: DataFrame containing the data.
+        time_col: Name of the column for the x-axis (e.g., 'week_date').
+        value_col: Name of the sentiment column for the y-axis.
+        window: Integer window size for rolling statistics.
+        title: Plot title.
+        ylabel: Y-axis label for the raw score.
+        filename: Name for the saved plot file.
+        plot_dir: Directory to save the plot.
+    """
+    logger.info(f"Generating rolling stats plot: {title}")
+    if time_col not in df.columns or value_col not in df.columns:
+        logger.error(f"Plot fail '{filename}': Missing columns '{time_col}' or '{value_col}'.")
+        return
+    if df.empty:
+        logger.warning(f"DataFrame empty for plot '{filename}'. Skipping.")
+        return
+
+    try:
+        # Calculate rolling statistics
+        rolling_mean = df[value_col].rolling(window=window, center=True, min_periods=1).mean()
+        rolling_std = df[value_col].rolling(window=window, center=True, min_periods=1).std()
+
+        fig, ax1 = plt.subplots(figsize=(18, 7)) # Slightly taller for dual axis
+
+        color1 = 'lightblue'
+        ax1.set_xlabel(time_col.replace('_', ' ').title(), fontsize=12)
+        ax1.set_ylabel(ylabel, color=color1, fontsize=12)
+        # Plot raw score lightly in the background
+        ax1.plot(df[time_col], df[value_col], color=color1, label=f'{ylabel} (Raw)', alpha=0.4, linewidth=0.5, marker='.', markersize=1)
+        # Plot rolling mean prominently
+        line1 = ax1.plot(df[time_col], rolling_mean, color='blue', label=f'{ylabel} ({window}w Rolling Mean)', linewidth=1.5)
+        ax1.tick_params(axis='y', labelcolor='blue')
+        ax1.grid(True, axis='y', linestyle=':', alpha=0.7)
+        y_min, y_max = rolling_mean.min(), rolling_mean.max()
+        y_range = y_max - y_min
+        ax1.set_ylim(y_min - 0.1*y_range, y_max + 0.1*y_range) # Auto-adjust ylim based on mean
+
+        # Create a second y-axis for rolling std dev
+        ax2 = ax1.twinx()
+        color2 = 'darkorange'
+        ax2.set_ylabel(f'{window}w Rolling Std Dev', color=color2, fontsize=12)
+        line2 = ax2.plot(df[time_col], rolling_std, color=color2, label=f'{ylabel} ({window}w Rolling Std Dev)', linestyle='--', linewidth=1.2)
+        ax2.tick_params(axis='y', labelcolor=color2)
+        ax2.set_ylim(bottom=0) # Std dev cannot be negative
+
+        fig.suptitle(title, fontsize=14)
+        # Combine legends
+        lines = line1 + line2
+        labels = [l.get_label() for l in lines]
+        ax1.legend(lines, labels, loc='upper left')
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout considering suptitle
+
+        if pd.api.types.is_datetime64_any_dtype(df[time_col]):
+             fig.autofmt_xdate(rotation=45, ha='right')
+
+        save_path = os.path.join(plot_dir, filename)
+        plt.savefig(save_path)
+        logger.info(f"Saved rolling stats plot: {save_path}")
+
+    except Exception as e:
+        logger.error(f"Plot fail '{filename}': {e}", exc_info=True)
+    finally:
+        if 'fig' in locals() and plt.fignum_exists(fig.number):
+            plt.close(fig)
+        else:
+            plt.close()
+
+def plot_training_history(log_dir: str, run_name: str, plot_dir: str):
+    """
+    Plots training and validation loss curves from TensorBoard metrics.csv.
+
+    Args:
+        log_dir: Path to the specific version directory inside lightning_logs
+                 (e.g., 'lightning_logs/my_run_name/version_0').
+        run_name: Name of the training run (for plot title/filename).
+        plot_dir: Directory to save the plot.
+    """
+    metrics_path = os.path.join(log_dir, "metrics.csv")
+    logger.info(f"Attempting to plot training history for '{run_name}' from: {metrics_path}")
+
+    if not os.path.exists(metrics_path):
+        logger.warning(f"Metrics file not found at {metrics_path}. Skipping training history plot.")
+        return
+
+    plot_fig_train = None # Initialize figure variable
+    try:
+        metrics_df = pd.read_csv(metrics_path)
+
+        # Filter for epoch-level metrics if step metrics are also present
+        # Plot 'val_loss' and 'train_loss_epoch' if available
+        epochs = metrics_df[metrics_df["val_loss"].notna()]["epoch"]
+        val_loss = metrics_df[metrics_df["val_loss"].notna()]["val_loss"]
+
+        # Check if train_loss_epoch exists, otherwise try train_loss_step (less ideal)
+        if "train_loss_epoch" in metrics_df.columns:
+            train_loss = metrics_df[metrics_df["train_loss_epoch"].notna()]["train_loss_epoch"]
+            train_epochs = metrics_df[metrics_df["train_loss_epoch"].notna()]["epoch"]
+            train_loss_label = "Train Loss (Epoch)"
+        elif "train_loss_step" in metrics_df.columns:
+             # Aggregate step loss by epoch (simple mean)
+             logger.warning("train_loss_epoch not found, using mean train_loss_step per epoch.")
+             train_loss_agg = metrics_df.dropna(subset=["train_loss_step"]).groupby("epoch")["train_loss_step"].mean()
+             train_loss = train_loss_agg.values
+             train_epochs = train_loss_agg.index
+             train_loss_label = "Train Loss (Step Avg)"
+        else:
+            logger.warning("No training loss found in metrics.csv. Plotting validation loss only.")
+            train_loss = None
+
+        if val_loss.empty and (train_loss is None or len(train_loss) == 0) :
+            logger.warning("No valid loss data found in metrics file. Skipping plot.")
+            return
+
+        plot_fig_train, ax = plt.subplots(figsize=(12, 6))
+
+        if not val_loss.empty:
+            ax.plot(epochs, val_loss, label="Validation Loss", marker='o', linestyle='-')
+        if train_loss is not None and len(train_loss) > 0:
+             # Ensure train_epochs aligns if using aggregated step loss
+             if len(train_epochs) == len(train_loss):
+                 ax.plot(train_epochs, train_loss, label=train_loss_label, marker='x', linestyle='--')
+             else:
+                 logger.warning("Length mismatch between train_epochs and train_loss. Skipping train loss plot.")
+
+
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Loss (Quantile Loss)")
+        ax.set_title(f"Training History - {run_name}")
+        ax.legend()
+        ax.grid(True, linestyle=':')
+        plt.tight_layout()
+
+        plot_filename = f"training_history_{run_name}.png"
+        save_path = os.path.join(plot_dir, plot_filename)
+        plt.savefig(save_path)
+        logger.info(f"Saved training history plot for '{run_name}' to {save_path}")
+
+    except FileNotFoundError:
+         logger.warning(f"Metrics file not found at {metrics_path}. Cannot plot training history.")
+    except KeyError as e:
+         logger.warning(f"Could not find expected columns ('val_loss', 'epoch', etc.) in {metrics_path}: {e}. Skipping plot.")
+    except Exception as e:
+        logger.error(f"Failed to plot training history for '{run_name}': {e}", exc_info=True)
+    finally:
+        if plot_fig_train is not None and plt.fignum_exists(plot_fig_train.number):
+            plt.close(plot_fig_train)
+        plt.close('all') # Close any other figures
+
+def plot_ccf(df: pd.DataFrame, var1: str, var2: str, max_lags: int,
+    title: str, filename: str, plot_dir: str):
+    """Plots the Cross-Correlation Function (CCF) between two variables."""
+    logger.info(f"Generating CCF plot: {title}")
+    if var1 not in df.columns or var2 not in df.columns:
+        logger.error(f"CCF Plot fail '{filename}': Missing columns '{var1}' or '{var2}'.")
+        return
+    if df[[var1, var2]].isnull().any().any():
+        logger.warning(f"NaNs found in columns for CCF '{filename}'. Dropping NaNs for calculation.")
+        df_ccf = df[[var1, var2]].dropna()
+    else:
+        df_ccf = df[[var1, var2]]
+
+    if len(df_ccf) < max_lags * 2:
+        logger.warning(f"Not enough data points ({len(df_ccf)}) for CCF plot '{filename}' with max_lags={max_lags}. Skipping.")
+        return
+
+    ccf_fig = None # Initialize figure variable
+    try:
+        # Calculate CCF - Note: ccf(x, y) calculates corr(x_{t+k}, y_t)
+        # We want corr(var1_{t+k}, var2_t) -> var1 leads var2 for positive k
+        # Or corr(var1_t, var2_{t+k}) -> var2 leads var1 for positive k
+        # Let's calculate corr(var1_{t+k}, var2_t) -> var1 is leading for positive k
+        correlation = ccf(df_ccf[var1], df_ccf[var2], adjusted=False) # Calculate raw correlation
+
+        nlags = max_lags
+        lags = np.arange(-nlags, nlags + 1)
+        # Extract relevant lags from ccf output (it calculates for positive lags only relative to first series)
+        # We need to reconstruct for negative lags as well
+        ccf_vals = np.zeros(len(lags))
+        # Positive lags (k >= 0): corr(var1_{t+k}, var2_t)
+        ccf_vals[nlags:] = correlation[:nlags+1]
+        # Negative lags (k < 0): corr(var1_{t-|k|}, var2_t) = corr(var1_t, var2_{t+|k|})
+        # This requires calculating ccf in the other direction
+        correlation_rev = ccf(df_ccf[var2], df_ccf[var1], adjusted=False)
+        ccf_vals[:nlags] = correlation_rev[1:nlags+1][::-1] # Get lags 1 to nlags and reverse
+
+        # Calculate confidence intervals (approximate for large samples)
+        conf_level = 1.96 / np.sqrt(len(df_ccf))
+
+        ccf_fig, ax = plt.subplots(figsize=(12, 5))
+        # Use stem plot for correlations
+        markerline, stemlines, baseline = ax.stem(lags, ccf_vals, linefmt='grey', markerfmt='o', basefmt='black')
+        plt.setp(markerline, 'color', 'blue', 'markersize', 4)
+        plt.setp(stemlines, 'color', 'blue', 'linewidth', 0.5)
+
+        # Plot confidence intervals
+        ax.axhline(conf_level, color='grey', linestyle='--', linewidth=0.8)
+        ax.axhline(-conf_level, color='grey', linestyle='--', linewidth=0.8)
+        ax.fill_between(lags, -conf_level, conf_level, color='grey', alpha=0.15)
+
+        ax.set_xlabel(f"Lag (Weeks) - Positive lag means '{var1}' leads '{var2}'")
+        ax.set_ylabel("Cross-correlation")
+        ax.set_title(title)
+        ax.grid(True, linestyle=':')
+        plt.tight_layout()
+        save_path = os.path.join(plot_dir, filename)
+        plt.savefig(save_path); logger.info(f"Saved plot: {save_path}")
+
+    except Exception as e:
+        logger.error(f"CCF Plot fail '{filename}': {e}", exc_info=True)
+    finally:
+        if ccf_fig is not None and plt.fignum_exists(ccf_fig.number):
+            plt.close(ccf_fig)
+        plt.close('all')
+
+
+def plot_rolling_correlation(df: pd.DataFrame, time_col: str, var1: str, var2: str,
+                           window: int, title: str, filename: str, plot_dir: str):
+    """Plots the rolling correlation between two variables."""
+    logger.info(f"Generating rolling correlation plot: {title}")
+    if time_col not in df.columns or var1 not in df.columns or var2 not in df.columns:
+        logger.error(f"Rolling Correlation fail '{filename}': Missing columns.")
+        return
+    if df[[var1, var2]].isnull().any().any():
+        logger.warning(f"NaNs found in columns for rolling correlation '{filename}'. Calculation might produce NaNs.")
+
+    roll_fig = None
+    try:
+        rolling_corr = df[var1].rolling(window=window, center=True, min_periods=window // 2).corr(df[var2])
+
+        roll_fig, ax = plt.subplots(figsize=(18, 6))
+        ax.plot(df[time_col], rolling_corr, label=f'{window//52}y Rolling Correlation', linewidth=1.5)
+        ax.axhline(0, color='grey', linestyle='--', linewidth=0.8)
+        ax.set_xlabel(time_col.replace('_', ' ').title())
+        ax.set_ylabel("Correlation Coefficient")
+        ax.set_title(title)
+        ax.legend()
+        ax.grid(True, linestyle=':')
+        plt.tight_layout()
+        if pd.api.types.is_datetime64_any_dtype(df[time_col]):
+            roll_fig.autofmt_xdate(rotation=45, ha='right')
+        save_path = os.path.join(plot_dir, filename)
+        plt.savefig(save_path); logger.info(f"Saved plot: {save_path}")
+
+    except Exception as e:
+        logger.error(f"Rolling Correlation fail '{filename}': {e}", exc_info=True)
+    finally:
+        if roll_fig is not None and plt.fignum_exists(roll_fig.number):
+            plt.close(roll_fig)
+        plt.close('all')
+
+def plot_acf_pacf(series: pd.Series, lags: int, title_prefix: str, filename_suffix: str, plot_dir: str):
+    """Plots ACF and PACF for a given time series."""
+    logger.info(f"Generating ACF/PACF plots for: {title_prefix}")
+    if series.isnull().any():
+        logger.warning(f"NaNs found in series for ACF/PACF '{title_prefix}'. Dropping NaNs.")
+        series = series.dropna()
+    if len(series) < lags * 2:
+         logger.warning(f"Not enough data points ({len(series)}) for ACF/PACF plot '{title_prefix}' with lags={lags}. Skipping.")
+         return
+
+    acf_fig = None; pacf_fig = None
+    try:
+        # ACF Plot
+        acf_fig = plt.figure(figsize=(12, 5))
+        plot_acf(series, lags=lags, ax=acf_fig.gca(), title=f'{title_prefix} - Autocorrelation (ACF)')
+        plt.tight_layout()
+        acf_filename = f"acf_{filename_suffix}.png"
+        plt.savefig(os.path.join(plot_dir, acf_filename)); logger.info(f"Saved plot: {acf_filename}")
+        plt.close(acf_fig)
+
+        # PACF Plot
+        pacf_fig = plt.figure(figsize=(12, 5))
+        # Method 'ywm' is often more stable for PACF
+        plot_pacf(series, lags=lags, ax=pacf_fig.gca(), title=f'{title_prefix} - Partial Autocorrelation (PACF)', method='ywm')
+        plt.tight_layout()
+        pacf_filename = f"pacf_{filename_suffix}.png"
+        plt.savefig(os.path.join(plot_dir, pacf_filename)); logger.info(f"Saved plot: {pacf_filename}")
+        plt.close(pacf_fig)
+
+    except Exception as e:
+        logger.error(f"ACF/PACF Plot fail for '{title_prefix}': {e}", exc_info=True)
+    finally:
+         if acf_fig is not None and plt.fignum_exists(acf_fig.number): plt.close(acf_fig)
+         if pacf_fig is not None and plt.fignum_exists(pacf_fig.number): plt.close(pacf_fig)
+         plt.close('all')
+
 # -----------------------------------------------------------------------------
 # 7. Interpretation & Granger Causality (Unchanged Functions)
 # -----------------------------------------------------------------------------
-def interpret_tft(model: TemporalFusionTransformer, val_dataloader: torch.utils.data.DataLoader, plot_dir: str):
-    """Calculates and saves TFT feature importance plots."""
-    logger.info("Calculating TFT feature importance...")
-    if model is None or val_dataloader is None or len(val_dataloader) == 0: logger.warning("Model/Dataloader missing, skip interpretation."); return
+def interpret_tft(model: TemporalFusionTransformer, val_dataloader: torch.utils.data.DataLoader,
+                  plot_dir: str, run_name: str): # Added run_name
+    """
+    Calculates and saves TFT feature importance plots with run_name prefix.
+    Includes revised predict() output handling for interpretation.
+    """
+    logger.info(f"Calculating TFT feature importance for run '{run_name}'...")
+    if model is None or val_dataloader is None or len(val_dataloader) == 0:
+        logger.warning("Model/Dataloader missing, skip interpretation.")
+        return
+
+    matplotlib_imported = False; fig_imp = None
+    try: import matplotlib.pyplot as plt; matplotlib_imported = True
+    except ImportError: logger.warning("matplotlib not found. Skipping plot generation.")
+
     try:
-        interpret_device = "cpu"; model.to(interpret_device); logger.info(f"Running interpretation on: {interpret_device}")
-        prediction_output = model.predict(val_dataloader, mode="raw", return_x=True)
-        if isinstance(prediction_output, (list, tuple)) and len(prediction_output) >= 1 and isinstance(prediction_output[0], dict):
-            raw_predictions_dict = {k: v.to(interpret_device) if isinstance(v, torch.Tensor) else v for k, v in prediction_output[0].items()}
-        elif isinstance(prediction_output, dict): raw_predictions_dict = {k: v.to(interpret_device) if isinstance(v, torch.Tensor) else v for k, v in prediction_output.items()}
-        else: logger.error(f"Unexpected predict() output type: {type(prediction_output)}. Skip interpretation."); return
-        interpretation = model.interpret_output(raw_predictions_dict, reduction="mean")
-        logger.info("Plotting TFT interpretation...")
-        fig_imp = model.plot_interpretation(interpretation, plot_type="variable_importance"); fig_imp.suptitle("TFT Feature Importance (Weekly)")
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95]); save_path_imp = os.path.join(plot_dir, "tft_interpretation_importance_weekly.png"); fig_imp.savefig(save_path_imp); logger.info(f"Saved interpretation plot to {save_path_imp}"); plt.close(fig_imp)
-    except ImportError: logger.warning("matplotlib issue. Skip interpretation plot.")
+        interpret_device = "cpu"; model.to(interpret_device)
+        logger.info(f"Running interpretation on: {interpret_device}")
+
+        logger.info("Calling model.predict(mode='raw') for interpretation...")
+        raw_predictions_dict = model.predict(val_dataloader, mode="raw")
+        logger.info(f"predict(mode='raw') output type: {type(raw_predictions_dict)}")
+        # --- End Predict call ---
+
+        # --- Validate output ---
+        if not isinstance(raw_predictions_dict, dict) or 'prediction' not in raw_predictions_dict:
+            logger.error(f"Predict(mode='raw') did not return expected dictionary. Got: {type(raw_predictions_dict)}. Skip interpretation.")
+            return
+        # --- End Validation ---
+
+        # Move tensors to the correct device
+        raw_predictions_dict_cpu = {k: v.to(interpret_device) if isinstance(v, torch.Tensor) else v
+                                    for k, v in raw_predictions_dict.items()}
+
+        # --- Calculate and Plot Interpretation ---
+        if matplotlib_imported:
+            interpretation = model.interpret_output(raw_predictions_dict, reduction="mean")
+            logger.info("Plotting TFT interpretation...")
+
+            fig_imp = model.plot_interpretation(interpretation, plot_type="variable_importance")
+            fig_imp.suptitle(f"TFT Feature Importance ({run_name})") # Add run_name
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            save_path_imp = os.path.join(plot_dir, f"tft_interpretation_importance_{run_name}.png") # Use run_name
+            fig_imp.savefig(save_path_imp)
+            logger.info(f"Saved interpretation plot for '{run_name}' to {save_path_imp}")
+            # Closing handled in finally
+        else:
+            logger.warning("Skipping interpretation plot generation as matplotlib could not be imported.")
+
+    except AttributeError as e: logger.error(f"AttributeError during interpretation: {e}.", exc_info=True)
     except Exception as e: logger.error(f"Error during interpretation: {e}", exc_info=True)
-    finally: model.to(DEVICE); plt.close('all')
+    finally:
+        if matplotlib_imported:
+            if fig_imp is not None and plt.fignum_exists(fig_imp.number): plt.close(fig_imp)
+            plt.close('all')
+        model.to(DEVICE)
+
+# Make sure InfeasibleTestError is imported if not already done
+from statsmodels.tools.sm_exceptions import InfeasibleTestError
 
 def run_granger_causality(df: pd.DataFrame, var1: str, var2: str, max_lag: int = 12) -> Optional[Dict[int, float]]:
-    """Performs Granger Causality tests using first differences. Returns {lag: p_value}."""
-    logger.info(f"Running Granger Causality test: '{var1}' -> '{var2}'? (Max lag: {max_lag} weeks)") # Updated label
-    if var1 not in df.columns or var2 not in df.columns: logger.error(f"Granger cols missing. Skip."); return None
-    data = df[[var1, var2]].copy(); data.dropna(inplace=True) # Drop rows with any NaNs in these cols
-    if data.shape[0] < max_lag + 5: logger.error(f"Not enough data ({data.shape[0]}) for Granger test after dropna. Skip."); return None
-    try: data_diff = data.diff().dropna()
-    except Exception as e: logger.error(f"Granger differencing error: {e}. Skip."); return None
-    if data_diff.shape[0] < max_lag + 5: logger.error(f"Not enough data ({data_diff.shape[0]}) after differencing. Skip."); return None
-    logger.info("Using first differences for Granger test.")
+    """
+    Performs Granger Causality tests using first differences.
+    Attempts test on levels if differenced series is constant (with warning).
+    Returns {lag: p_value}.
+    """
+    logger.info(f"Running Granger Causality test: '{var1}' -> '{var2}'? (Max lag: {max_lag} weeks)")
+    if var1 not in df.columns or var2 not in df.columns:
+        logger.error(f"Granger columns missing ('{var1}' or '{var2}'). Skipping test.")
+        return None
+
+    data = df[[var1, var2]].copy()
+    # Drop rows with NaNs *before* checking for constant values
+    data.dropna(inplace=True)
+
+    if data.shape[0] < max_lag + 5: # Check after dropping NaNs
+        logger.error(f"Not enough data ({data.shape[0]}) for Granger test after dropna. Skipping test.")
+        return None
+
+    # Check for constant columns in the original data
+    if (data[var1].nunique() <= 1) or (data[var2].nunique() <= 1):
+        logger.error(f"Input data for '{var1}' or '{var2}' is constant before differencing. Granger test impossible. Skipping test.")
+        return None
+
+    # Proceed with differencing
     try:
-        gc_result = grangercausalitytests(data_diff[[var2, var1]], maxlag=max_lag, verbose=False)
+        data_diff = data.diff().dropna()
+    except Exception as e:
+        logger.error(f"Granger differencing error: {e}. Skipping test.")
+        return None
+
+    if data_diff.shape[0] < max_lag + 5: # Check after differencing
+        logger.error(f"Not enough data ({data_diff.shape[0]}) after differencing. Skipping test.")
+        return None
+
+    # Check for constant columns *after* differencing
+    test_on_diff = True
+    if (data_diff[var1].nunique() <= 1) or (data_diff[var2].nunique() <= 1):
+        logger.warning(f"Constant column found after differencing for '{var1}' or '{var2}'.")
+        # Attempt test on levels as fallback
+        logger.warning(f"Attempting Granger test on raw levels for '{var1}' -> '{var2}' (use results with caution).")
+        test_on_diff = False
+        test_data = data[[var2, var1]] # Use original data
+        if test_data.shape[0] < max_lag + 5: # Re-check length for levels data
+             logger.error("Not enough data for levels test. Skipping.")
+             return None
+    else:
+        logger.info("Using first differences for Granger test.")
+        test_data = data_diff[[var2, var1]] # Use differenced data
+
+
+    # Perform the test
+    try:
+        gc_result = grangercausalitytests(test_data, maxlag=max_lag, verbose=False)
         p_values = {lag: gc_result[lag][0]['ssr_ftest'][1] for lag in range(1, max_lag + 1)}
+
+        # Log results clearly
         significant_lags = [lag for lag, p in p_values.items() if p < 0.05]
-        if significant_lags: logger.info(f" Granger Result ('{var1}' -> '{var2}'): Significant at lags: {significant_lags} (p < 0.05).")
-        else: logger.info(f" Granger Result ('{var1}' -> '{var2}'): Not significant up to lag {max_lag} (p >= 0.05).")
+        test_type = "(Differences)" if test_on_diff else "(Levels - CAUTION!)"
+        if significant_lags:
+            logger.info(f" Granger Result ('{var1}' -> '{var2}') {test_type}: Significant at lags: {significant_lags} (p < 0.05).")
+        else:
+            logger.info(f" Granger Result ('{var1}' -> '{var2}') {test_type}: Not significant up to lag {max_lag} (p >= 0.05).")
         return p_values
-    except Exception as e: logger.error(f"Granger test error: {e}", exc_info=True); return None
+
+    except InfeasibleTestError as e: # Catch specific error
+         logger.error(f"Granger test error for '{var1}' -> '{var2}' (Infeasible): {e}. Likely constant values even in levels.")
+         return None
+    except Exception as e:
+        logger.error(f"Granger test error for '{var1}' -> '{var2}': {e}", exc_info=True)
+        return None
+
+@memory.cache
+def calculate_sentiment_scores_dataframe(df: pd.DataFrame, text_col: str = "text", batch_size: int = 32) -> pd.DataFrame:
+    """Calculates multiple MacBERTh sentiment scores for the text column."""
+    logger.info(f"Calculating multiple MacBERTh sentiment scores for '{text_col}'...")
+    if text_col not in df.columns: raise ValueError(f"Column '{text_col}' not found.")
+
+    df_copy = df.copy()
+    df_copy[text_col] = df_copy[text_col].astype(str).fillna('') # Ensure string type
+
+    scorer = MacBERThSentimentScorer() # Uses the class defined above
+    texts_to_score = df_copy[text_col].tolist()
+
+    # Get the dictionary of scores {score_name: [list_of_scores]}
+    sentiment_scores_dict = scorer.calculate_sentiment_scores(texts_to_score, batch_size=batch_size)
+
+    # Add each score list as a new column
+    score_cols_added = []
+    for score_name, scores_list in sentiment_scores_dict.items():
+        if scores_list: # Only add if scores were calculated
+             df_copy[score_name] = scores_list
+             score_cols_added.append(score_name) # Keep track of added columns
+             logger.info(f"Added sentiment scores for '{score_name}'. Stats: Min={np.min(scores_list):.3f}, Max={np.max(scores_list):.3f}, Mean={np.mean(scores_list):.3f}, Std={np.std(scores_list):.3f}")
+        else:
+             logger.warning(f"No scores calculated for '{score_name}', column not added.")
+
+    logger.info("Multiple sentiment scoring complete.")
+    # Return identifier columns PLUS the newly added score columns
+    id_cols = ['week_date', 'doc_id', 'trial_id'] # Keep identifiers
+    # Ensure we only select columns that actually exist in the df_copy
+    final_cols = [col for col in id_cols + score_cols_added if col in df_copy.columns]
+    return df_copy[final_cols]
 
 def plot_granger_causality_results(p_values_dict: Dict[str, Optional[Dict[int, float]]], title_prefix: str, plot_dir: str):
     """Plots the p-values from Granger Causality tests."""
@@ -1390,206 +2229,228 @@ def plot_granger_causality_results(p_values_dict: Dict[str, Optional[Dict[int, f
     filename = f"{title_prefix.lower().replace(' ','_')}_granger_causality_weekly.png"
     save_path = os.path.join(plot_dir, filename); plt.savefig(save_path); logger.info(f"Saved Granger plot to {save_path}"); plt.close(fig)
 
-# -----------------------------------------------------------------------------
-# 8. MAIN Execution Logic (UPDATED FOR OLD BAILEY & WEEKLY)
-# -----------------------------------------------------------------------------
 def main():
-    """Main script execution flow using Old Bailey (Structured + Text) and Weekly data."""
-    logger.info("--- Starting Historical Analysis Script (Old Bailey - Combined Approach) ---")
+    """
+    Runs analysis pipeline using pre-computed sentiment, aggregates over full period,
+    then crops final weekly data for analysis.
+    """
+    logger.info("--- Starting Historical Analysis Script (Old Bailey - Combined Metrics - Aggregate then Crop) ---")
     script_start_time = time.time()
-    final_df = None; best_model = None; trainer = None; val_dl = None; val_ds = None
+    final_df_cropped = None # Renamed variable for clarity
+    smoothed_structural_col_names_map = { # Mapping used in aggregate func
+            'violent_crime_prop': 'violent_crime_prop_smooth', 'property_crime_prop': 'property_crime_prop_smooth',
+            'conviction_rate': 'conviction_rate_smooth', 'death_sentence_rate': 'death_sentence_rate_smooth',
+            'transport_rate': 'transport_rate_smooth', 'avg_punishment_score': 'avg_punishment_score_smooth'
+    }
+    best_model = None; trainer = None; val_dl = None; val_ds = None
 
     try:
         os.makedirs(PLOT_DIR, exist_ok=True); logger.info(f"Plots directory: {PLOT_DIR}")
-        lag_weeks = 4
+
+        # --- DEFINE ANALYSIS PERIOD FOR FINAL CROPPING ---
+        ANALYSIS_START_DATE = '1719-01-01' 
+        ANALYSIS_END_DATE = '1829-12-31'
+        logger.info(f"*** Final analysis will be restricted to date range: {ANALYSIS_START_DATE} to {ANALYSIS_END_DATE} ***")
+        # ---------------------------------------------
 
         # --- Step 1: Parse Old Bailey Data (Structured + Text) ---
-        logger.info("--- Step 1: Parsing Old Bailey Sessions Papers (Structured Data + Text) ---")
-        # This function should return ['week_date', 'doc_id', 'trial_id', 'text', 'offence_cat', 'verdict_cat', 'punishment_cat']
+        # Still need the full parsed data for aggregation input
+        logger.info("--- Step 1: Parsing Old Bailey Sessions Papers (Full Period) ---")
         ob_df_parsed = parse_old_bailey_papers(ob_dir=OLD_BAILEY_DIR, start_year=START_YEAR, end_year=END_YEAR)
-        if not isinstance(ob_df_parsed, pd.DataFrame) or ob_df_parsed.empty: raise ValueError("Step 1 Failed: No Old Bailey trial data found/parsed.")
-        logger.info(f"Parsed {len(ob_df_parsed)} trial accounts.")
+        if ob_df_parsed.empty: raise ValueError("Step 1 Failed.")
+        if 'text' not in ob_df_parsed.columns: raise ValueError("Parsing missing 'text'.")
 
-        # --- Step 2: Preprocess Trial Text ---
-        logger.info("--- Step 2: Preprocessing Old Bailey Trial Text ---")
-        USE_SYMSPELL_CORRECTION = False
-        # This function adds 'processed_text' column
-        ob_df_processed = preprocess_text_dataframe(ob_df_parsed, text_col='text', use_symspell=USE_SYMSPELL_CORRECTION)
-        if ob_df_processed.empty: raise ValueError("Step 2 Failed: Text preprocessing resulted in empty DataFrame.")
-        # Keep relevant structured columns along with processed text
-        cols_to_keep = ['week_date', 'doc_id', 'trial_id', 'processed_text', 'offence_cat', 'verdict_cat', 'punishment_cat']
-        # Ensure all columns exist before selection
-        cols_to_keep_exist = [col for col in cols_to_keep if col in ob_df_processed.columns]
-        ob_df_processed = ob_df_processed[cols_to_keep_exist]
-        del ob_df_parsed # Free memory
+        # --- Step 2: Calculate Sentiment Scores (Uses Cache if Run Before) ---
+        # Run this on the full parsed data so it's available for aggregation
+        logger.info("--- Step 2: Calculating/Loading Targeted Sentiment Scores per Trial (Full Period) ---")
+        ob_df_sentiment_scores = calculate_sentiment_scores_dataframe(ob_df_parsed, text_col='text', batch_size=BATCH_SIZE // 2)
+        if ob_df_sentiment_scores.empty: logger.warning("Step 2 Warning: Sentiment scoring resulted in empty DataFrame.")
+        else: logger.info(f"Sentiment scores calculated/loaded. Columns: {ob_df_sentiment_scores.columns.tolist()}")
 
-        # --- Step 3: Calculate Fear Scores per Trial ---
-        logger.info("--- Step 3: Calculating MacBERTh Scores per Trial ---")
-        # This function adds 'fear_score' column
-        ob_df_scored = calculate_fear_scores_dataframe(ob_df_processed, text_col='processed_text', batch_size=BATCH_SIZE // 2)
-        if 'fear_score' not in ob_df_scored.columns: raise ValueError("Step 3 Failed: Fear scoring failed.")
-        logger.info(f"Scored {len(ob_df_scored)} trials.")
-        del ob_df_processed # Free memory
-
-        # --- Step 4: Load Weekly Mortality ---
-        logger.info("--- Step 4: Loading and Processing Weekly Mortality Data ---")
+        # --- Step 3: Load Weekly Mortality (Full Period) ---
+        logger.info("--- Step 3: Loading and Processing Weekly Mortality Data (Full Period) ---")
         weekly_mortality_df = load_and_aggregate_weekly_mortality(file_path=COUNTS_FILE, start_year=START_YEAR, end_year=END_YEAR)
-        if weekly_mortality_df.empty: raise ValueError("Step 4 Failed: No weekly mortality data found.")
+        if weekly_mortality_df.empty: raise ValueError("Step 3 Failed.")
 
-        # --- Step 5: Aggregate Combined Metrics (Weekly) & Merge ---
-        logger.info(f"--- Step 5: Aggregating Weekly Combined Metrics and Merging ---")
-        # This function uses the trial-level scores and structured data
-        final_df = aggregate_combined_metrics(ob_df_scored, weekly_mortality_df)
-        if final_df.empty: raise ValueError("Step 5 Failed: Merging/Clipping resulted in empty DataFrame.")
-        del ob_df_scored; del weekly_mortality_df # Free memory
+        # --- Step 4: Aggregate Combined Metrics (OVER FULL PERIOD) ---
+        logger.info(f"--- Step 4: Aggregating Weekly Combined Metrics and Merging (Full Period) ---")
+        # The aggregate function itself performs clipping at the end of ITS process
+        final_df_full = aggregate_weekly_combined_metrics(ob_df_parsed, ob_df_sentiment_scores, weekly_mortality_df)
+        if final_df_full is None or final_df_full.empty: raise ValueError("Step 4 Failed.")
+        logger.info(f"Full aggregated DataFrame shape (before final crop): {final_df_full.shape}")
+        del ob_df_parsed; del ob_df_sentiment_scores; del weekly_mortality_df
 
-        # Save final weekly data
+        # --- Step 5: CROP the Aggregated DataFrame to Analysis Period ---
+        logger.info(f"--- Step 5: Cropping Aggregated Data to {ANALYSIS_START_DATE} - {ANALYSIS_END_DATE} ---")
+        if 'week_date' not in final_df_full.columns:
+             raise ValueError("Aggregation failed to produce 'week_date' column.")
+        final_df_cropped = final_df_full[
+            (final_df_full['week_date'] >= pd.to_datetime(ANALYSIS_START_DATE)) &
+            (final_df_full['week_date'] <= pd.to_datetime(ANALYSIS_END_DATE))
+        ].copy() # Create a copy to avoid SettingWithCopyWarning later
+
+        # Check if data remains after cropping
+        if final_df_cropped.empty:
+             raise ValueError(f"No data remains after cropping final aggregated DataFrame to {ANALYSIS_START_DATE}-{ANALYSIS_END_DATE}. Check dates or aggregation results.")
+
+        # Optional: Reset time_idx for the cropped period if desired, needed if TFT requires 0-based index
+        # final_df_cropped['time_idx'] = (final_df_cropped['week_date'] - final_df_cropped['week_date'].min()).dt.days // 7
+        # logger.info("Re-indexed time_idx for cropped period.")
+
+        logger.info(f"Cropped final DataFrame shape: {final_df_cropped.shape}")
+        logger.info(f"Cropped final DataFrame time index range: {final_df_cropped['time_idx'].min()} - {final_df_cropped['time_idx'].max()}")
+        del final_df_full # Free memory
+
+        # --- Step 5.5: Save Cropped Data ---
         try:
-            # Make filename more descriptive
-            final_df.to_csv(os.path.join(PLOT_DIR, f"final_weekly_data_combined_metrics_logdeaths.csv"), index=False)
-            logger.info("Saved final weekly data with combined metrics.")
+            save_filename = f"final_weekly_data_combined_metrics_logdeaths_{ANALYSIS_START_DATE[:4]}_{ANALYSIS_END_DATE[:4]}_agg_then_crop.csv"
+            final_df_cropped.to_csv(os.path.join(PLOT_DIR, save_filename), index=False)
+            logger.info(f"Saved CROPPED final weekly data for period {ANALYSIS_START_DATE[:4]}-{ANALYSIS_END_DATE[:4]}.")
         except Exception as e: logger.warning(f"Could not save final data CSV: {e}")
 
-        # --- Step 5.5: Generate Data Exploration Plots (Weekly) ---
-        logger.info("--- Step 5.5: Generating Data Exploration Plots (Weekly - Combined Metrics) ---")
-        # Define columns based on the new aggregation function's output
-        prop_sent_col = 'property_crime_sentiment'; viol_sent_col = 'violent_crime_sentiment'; overall_sent_col = 'overall_fear_sentiment'
-        viol_prop_col = 'violent_crime_prop'; prop_prop_col = 'property_crime_prop'; conv_rate_col = 'conviction_rate'
-        punish_score_col = 'avg_punishment_score'
-        lag_prop_sent_col = 'property_crime_sentiment_lag4w' # Example lagged column (adjust if lagging different col)
-        prop_sent_std_col = 'property_crime_sentiment_std' # Example standardized column (adjust if standardizing different col)
+        # --- Step 6: Generate Plots (using CROPPED final_df) ---
+        logger.info("--- Step 6: Generating Data Exploration Plots (Cropped Period) ---")
+        # Define columns based on expected output
+        viol_prop_smooth_col = 'violent_crime_prop_smooth'; conv_rate_smooth_col = 'conviction_rate_smooth';
+        disease_sent_col = 'disease_sentiment'; hardship_sent_col = 'hardship_sentiment'
+        lag_hardship_sent_col = f'hardship_sentiment_lag{LAG_WEEKS}w'
+        hardship_sent_std_col = 'hardship_sentiment_std'
+        all_possible_sent_cols = list(MacBERThSentimentScorer._word_lists.keys())
+        total_trials_col = 'total_trials'
 
-        if final_df is not None and not final_df.empty:
-            plot_time_series(final_df, 'week_date', 'deaths', 'Weekly Deaths Over Time (London Bills - Original Scale)', 'Total Deaths', 'deaths_weekly_timeseries_original.png', PLOT_DIR)
-            if 'log_deaths' in final_df.columns: plot_time_series(final_df, 'week_date', 'log_deaths', 'Weekly Log(Deaths+1) Over Time', 'Log(Deaths+1)', 'deaths_weekly_timeseries_log.png', PLOT_DIR)
-            else: logger.error("Column 'log_deaths' not found for plotting.")
+        # All plotting now uses final_df_cropped
+        if final_df_cropped is not None and not final_df_cropped.empty:
+            plot_time_series(final_df_cropped, 'week_date', 'deaths', 'Weekly Deaths Over Time (Original)', 'Total Deaths', 'deaths_weekly_timeseries_original.png', PLOT_DIR)
+            if 'log_deaths' in final_df_cropped.columns: plot_time_series(final_df_cropped, 'week_date', 'log_deaths', 'Weekly Log(Deaths+1) Over Time', 'Log(Deaths+1)', 'deaths_weekly_timeseries_log.png', PLOT_DIR)
+            if viol_prop_smooth_col in final_df_cropped.columns: plot_time_series(final_df_cropped, 'week_date', viol_prop_smooth_col, 'Weekly Violent Crime Prop (Smoothed)', 'Proportion of Trials', f'{viol_prop_smooth_col}_timeseries.png', PLOT_DIR)
+            if conv_rate_smooth_col in final_df_cropped.columns: plot_time_series(final_df_cropped, 'week_date', conv_rate_smooth_col, 'Weekly Conviction Rate (Smoothed)', 'Rate', f'{conv_rate_smooth_col}_timeseries.png', PLOT_DIR)
 
-            # Plot new sentiment metrics
-            if prop_sent_col in final_df.columns: plot_time_series(final_df, 'week_date', prop_sent_col, 'Weekly Sentiment (Property Crimes)', 'Avg. Fear Score', 'property_crime_sentiment_timeseries.png', PLOT_DIR)
-            if viol_sent_col in final_df.columns: plot_time_series(final_df, 'week_date', viol_sent_col, 'Weekly Sentiment (Violent Crimes)', 'Avg. Fear Score', 'violent_crime_sentiment_timeseries.png', PLOT_DIR)
-            if overall_sent_col in final_df.columns: plot_time_series(final_df, 'week_date', overall_sent_col, 'Weekly Sentiment (Overall)', 'Avg. Fear Score', 'overall_fear_sentiment_timeseries.png', PLOT_DIR)
+            sentiment_zoom = (0.60, 0.85)
+            for sent_col in all_possible_sent_cols:
+                if sent_col in final_df_cropped.columns:
+                    plot_title = f"Weekly Avg. {sent_col.replace('_', ' ').title()}"
+                    plot_filename = f"{sent_col}_timeseries_zoomed.png"
+                    plot_time_series(final_df_cropped, 'week_date', sent_col, plot_title, 'Avg. Score', plot_filename, PLOT_DIR, zoom_ylim=sentiment_zoom, mark_zero_threshold=0.1)
+                else: logger.info(f"Sentiment column '{sent_col}' not found, skipping plot.")
 
-            # Plot key structured metrics
-            if viol_prop_col in final_df.columns: plot_time_series(final_df, 'week_date', viol_prop_col, 'Weekly Violent Crime Proportion', 'Proportion of Trials', 'violent_crime_prop_timeseries.png', PLOT_DIR)
-            if prop_prop_col in final_df.columns: plot_time_series(final_df, 'week_date', prop_prop_col, 'Weekly Property Crime Proportion', 'Proportion of Trials', 'property_crime_prop_timeseries.png', PLOT_DIR)
-            if conv_rate_col in final_df.columns: plot_time_series(final_df, 'week_date', conv_rate_col, 'Weekly Conviction Rate', 'Rate', 'conviction_rate_timeseries.png', PLOT_DIR)
-            if punish_score_col in final_df.columns: plot_time_series(final_df, 'week_date', punish_score_col, 'Weekly Avg. Punishment Score', 'Avg Score', 'punishment_score_timeseries.png', PLOT_DIR)
+            if total_trials_col in final_df_cropped.columns:
+                plot_time_series(final_df_cropped, 'week_date', total_trials_col,'Weekly Total Old Bailey Trials Processed', 'Number of Trials', 'total_trials_weekly_timeseries.png', PLOT_DIR)
 
-            # Dual axis: Log Deaths vs Property Crime Sentiment (Standardized) - Adjust col names if needed
-            # Ensure the standardized column exists from the aggregation step
-            if 'log_deaths' in final_df.columns and prop_sent_std_col in final_df.columns:
-                 plot_dual_axis(final_df, 'week_date', 'log_deaths', prop_sent_std_col, 'Log(Deaths+1)', 'Std. Property Crime Sent.', 'Log(Deaths+1) vs Std. Property Crime Sentiment', 'logdeaths_vs_prop_crime_sent_std_dual_axis.png', PLOT_DIR)
-            elif 'log_deaths' in final_df.columns and prop_sent_col in final_df.columns:
-                 logger.warning(f"Standardized column '{prop_sent_std_col}' not found, plotting original '{prop_sent_col}' on dual axis.")
-                 plot_dual_axis(final_df, 'week_date', 'log_deaths', prop_sent_col, 'Log(Deaths+1)', 'Property Crime Sent.', 'Log(Deaths+1) vs Property Crime Sentiment', 'logdeaths_vs_prop_crime_sent_dual_axis.png', PLOT_DIR)
+            if 'log_deaths' in final_df_cropped.columns and hardship_sent_std_col in final_df_cropped.columns:
+                plot_dual_axis(final_df_cropped, 'week_date', 'log_deaths', hardship_sent_std_col, 'Log(Deaths+1)', 'Std. Hardship Sent.', 'Log(Deaths+1) vs Std. Hardship Sentiment', 'logdeaths_vs_hardship_sent_std_dual_axis.png', PLOT_DIR)
+            if 'log_deaths' in final_df_cropped.columns and lag_hardship_sent_col in final_df_cropped.columns:
+                plot_scatter_fear_vs_deaths(final_df_cropped, lag_hardship_sent_col, 'log_deaths', f'Log(Deaths+1) vs Lagged ({LAG_WEEKS}w) Hardship Sentiment', f'scatter_logdeaths_vs_{lag_hardship_sent_col}.png', PLOT_DIR)
+            plot_weekly_boxplot(final_df_cropped, 'deaths', 'Weekly Distribution of Deaths (by Week of Year - Original Scale)', 'boxplot_deaths_weekly_original.png', PLOT_DIR)
+            # --- ADD NEW PLOTS ---
+            logger.info("--- Generating Additional Diagnostic Plots ---")
+            plot_lags = 20 # How many lags for CCF/ACF/PACF
+            rolling_window_years = 5
+            rolling_window_weeks = rolling_window_years * 52
 
-            # Scatter: Log Deaths vs Lagged Property Crime Sentiment - Adjust col names if needed
-            if 'log_deaths' in final_df.columns and lag_prop_sent_col in final_df.columns:
-                plot_scatter_fear_vs_deaths(final_df, lag_prop_sent_col, 'log_deaths', f'Log(Deaths+1) vs Lagged ({lag_weeks}w) Property Crime Sentiment', f'scatter_logdeaths_vs_{lag_prop_sent_col}.png', PLOT_DIR)
-            elif 'log_deaths' in final_df.columns and prop_sent_col in final_df.columns:
-                 logger.warning(f"Lagged column '{lag_prop_sent_col}' not found, plotting scatter with original '{prop_sent_col}'.")
-                 plot_scatter_fear_vs_deaths(final_df, prop_sent_col, 'log_deaths', 'Log(Deaths+1) vs Property Crime Sentiment', f'scatter_logdeaths_vs_{prop_sent_col}.png', PLOT_DIR)
+            # CCF Plots (Example: LogDeaths vs Hardship Sentiment)
+            if 'log_deaths' in final_df_cropped.columns and hardship_sent_col in final_df_cropped.columns:
+                plot_ccf(final_df_cropped, 'hardship_sentiment', 'log_deaths', plot_lags,
+                         f"CCF: Hardship Sentiment vs Log(Deaths)",
+                         "ccf_hardship_vs_logdeaths.png", PLOT_DIR)
+
+            # Rolling Correlation (Example: LogDeaths vs Property Crime Prop Smooth)
+            prop_crime_smooth = smoothed_structural_col_names_map.get('property_crime_prop')
+            if prop_crime_smooth and 'log_deaths' in final_df_cropped.columns and prop_crime_smooth in final_df_cropped.columns:
+                 plot_rolling_correlation(final_df_cropped, 'week_date', 'log_deaths', prop_crime_smooth,
+                                         window=rolling_window_weeks,
+                                         title=f"{rolling_window_years}y Rolling Correlation: LogDeaths vs Property Crime Prop (Smooth)",
+                                         filename=f"roll_corr_logdeaths_vs_{prop_crime_smooth}.png", plot_dir=PLOT_DIR)
+
+            # ACF/PACF Plots
+            if 'log_deaths' in final_df_cropped.columns:
+                plot_acf_pacf(final_df_cropped['log_deaths'], plot_lags, "Log(Deaths+1)", "log_deaths", PLOT_DIR)
+            if hardship_sent_col in final_df_cropped.columns:
+                 plot_acf_pacf(final_df_cropped[hardship_sent_col], plot_lags, "Hardship Sentiment", "hardship_sentiment", PLOT_DIR)
+
+            # --- END ADD NEW PLOTS ---
+
+        else: logger.warning("Cropped final_df empty, skipping data plots.")
 
 
-            plot_weekly_boxplot(final_df, 'deaths', 'Weekly Distribution of Deaths (by Week of Year - Original Scale)', 'boxplot_deaths_weekly_original.png', PLOT_DIR)
-        else: logger.warning("final_df empty, skipping data plots.")
+        # === Step 7: Train TFT Model (using CROPPED final_df) ===
+        run_name = f"combined_{ANALYSIS_START_DATE[:4]}_{ANALYSIS_END_DATE[:4]}"
+        logger.info(f"--- Step 7: Training and Evaluating TFT Model ({run_name}) ---")
+        if final_df_cropped is not None and not final_df_cropped.empty:
+            # Get standardized features from the cropped dataframe
+            tft_real_features_exist = [col for col in final_df_cropped.columns if col.endswith('_std')]
+            logger.info(f"Using these standardized features for TFT ({run_name}): {tft_real_features_exist}")
 
-        # === Step 6: Train and Evaluate TFT Model (Weekly) ===
-        logger.info("--- Step 6: Training and Evaluating TFT Model (Weekly - Target: log_deaths, Features: Combined Metrics) ---")
-        if final_df is not None and not final_df.empty:
-            # *** Define the STANDARDIZED metrics to use as features for TFT ***
-            # Choose a subset based on hypotheses and initial analysis
-            # Example: Use standardized sentiment metrics and conviction rate + lags
-            # These are the *base* names before '_std' is added
-            tft_feature_base_cols = [
-                'overall_fear_sentiment', 'violent_crime_sentiment', 'property_crime_sentiment', # Sentiment features
-                'violent_crime_prop', 'property_crime_prop', 'conviction_rate', 'avg_punishment_score', # Structured features
-                lag_prop_sent_col # Include the lagged version base name
-            ]
-            # Create the list of standardized names expected from aggregate_combined_metrics
-            tft_real_features_std = [col + '_std' for col in tft_feature_base_cols if col + '_std' in final_df.columns]
-
-            if not tft_real_features_std:
-                logger.error("No standardized feature columns found to use for TFT. Skipping training.")
-                best_model, trainer, val_dl, val_ds = None, None, None, None
+            if not tft_real_features_exist: logger.error("No standardized features found in cropped df. Skipping training.")
             else:
-                logger.info(f"Using these standardized features as time_varying_unknown_reals for TFT: {tft_real_features_std}")
-                # Ensure train_tft_model is adapted to take this list dynamically
-                # (Using the modified train_tft_model from previous response)
+                # Train on the cropped data
                 best_model, trainer, val_dl, val_ds = train_tft_model(
-                    df=final_df,
-                    time_varying_reals_cols=tft_real_features_std, # Pass the list of existing std columns
-                    encoder_length=WEEKLY_MAX_ENCODER_LENGTH,
-                    pred_length=WEEKLY_MAX_PREDICTION_LENGTH,
-                    # Pass other TFT hyperparameters from config if needed
-                    max_epochs=MAX_EPOCHS,
-                    batch_size=BATCH_SIZE,
-                    lr=LEARNING_RATE,
-                    hidden_size=HIDDEN_SIZE,
-                    attn_heads=ATTENTION_HEAD_SIZE,
-                    dropout=DROPOUT,
-                    hidden_cont_size=HIDDEN_CONTINUOUS_SIZE,
-                    clip_val=GRADIENT_CLIP_VAL
+                    df=final_df_cropped, # Pass the cropped dataframe
+                    time_varying_reals_cols=tft_real_features_exist,
+                    run_name=run_name,
+                    max_epochs=75,
                 )
 
-            if best_model and val_dl and val_ds:
-                logger.info("--- Step 6.5: Evaluating Best TFT Model ---")
-                eval_metrics = evaluate_model(best_model, val_dl, val_ds, plot_dir=PLOT_DIR)
-                logger.info(f"Final Validation Metrics: {eval_metrics}")
-            # Adjust message if training was skipped due to lack of features
-            elif not tft_real_features_std and not final_df.empty:
-                 logger.warning("TFT Training skipped due to missing standardized features.")
-            else: logger.error("TFT Model training failed or evaluation components missing.")
-        else: logger.error("Final DataFrame empty, cannot train TFT model.")
+                # Evaluate Model
+                if best_model and val_dl and val_ds:
+                    logger.info(f"--- Evaluating Best Model for Run: {run_name} ---")
+                    eval_metrics = evaluate_model(best_model, val_dl, val_ds, PLOT_DIR, run_name=run_name)
+                    logger.info(f"Final Validation Metrics ({run_name}): {eval_metrics}")
 
-        # === Step 7: Interpretation & Granger Causality (Weekly) ===
-        logger.info("--- Step 7: Model Interpretation & Granger Causality (Weekly - Using Combined Metrics) ---")
-        if final_df is not None and not final_df.empty:
-            # Interpretation needs model trained on these features
+                    # Plot Training History
+                    if trainer and hasattr(trainer, 'logger') and hasattr(trainer.logger, 'log_dir'):
+                         logger.info(f"--- Plotting Training History for Run: {run_name} ---")
+                         plot_training_history(trainer.logger.log_dir, run_name, PLOT_DIR)
+                else: logger.error(f"TFT Model training/loading failed for run '{run_name}'.")
+        else: logger.error("Cropped Final DataFrame empty, cannot train TFT model.")
+
+
+        # === Step 8: Interpretation & Granger Causality (using CROPPED final_df) ===
+        logger.info("--- Step 8: Model Interpretation & Granger Causality (Cropped Period) ---")
+        if final_df_cropped is not None and not final_df_cropped.empty:
+             # Interpretation
             if best_model and val_dl:
-                logger.info("--- Running TFT Interpretation ---")
-                interpret_tft(best_model, val_dl, PLOT_DIR)
-            else:
-                logger.warning("Skipping TFT interpretation as model was not trained or available.")
+                logger.info(f"--- Running TFT Interpretation ({run_name}) ---")
+                interpret_tft(best_model, val_dl, PLOT_DIR, run_name=run_name)
+            else: logger.warning("Skipping TFT interpretation.")
 
-            logger.info("--- Running Granger Causality Tests (Weekly - Using log_deaths & Combined Metrics) ---")
+            # Granger Causality
+            logger.info("--- Running Granger Causality Tests (Cropped Period) ---")
+            # Granger runs on the final cropped dataframe
             granger_results = {}
-            max_weekly_lag = 8
+            max_weekly_lag = 12
             target_col_granger = 'log_deaths'
+            # Define base names again for clarity (even though derived from class)
+            sentiment_cols_agg_base = list(MacBERThSentimentScorer._word_lists.keys())
+            lagged_cols_base = [smoothed_structural_col_names_map.get('conviction_rate'), 'hardship_sentiment'] # Use smooth name
+            lagged_cols_base = [col for col in lagged_cols_base if col is not None]
 
-            # Test the NON-standardized metrics against log_deaths
-            # Adjust column names to match those created in aggregate_combined_metrics
-            metrics_to_test_granger = {
-                'overall_fear_sentiment': 'Overall Sentiment',
-                'violent_crime_sentiment': 'Violent Crime Sent.',
-                'property_crime_sentiment': 'Property Crime Sent.',
-                 lag_prop_sent_col: f'Lag {lag_weeks}w Property Sent.', # Use the variable holding the lagged name
-                'violent_crime_prop': 'Violent Crime Prop',
-                'property_crime_prop': 'Property Crime Prop',
-                'conviction_rate': 'Conviction Rate',
-                'avg_punishment_score': 'Avg Punishment Score'
-            }
+            metrics_to_test_granger = {}
+            for base_col, smooth_col in smoothed_structural_col_names_map.items(): metrics_to_test_granger[smooth_col] = f"{base_col.replace('_', ' ').title()} (Smooth)"
+            for base_col in sentiment_cols_agg_base: metrics_to_test_granger[base_col] = base_col.replace('_', ' ').title()
+            for base_col in lagged_cols_base:
+                 lag_col = f"{base_col}_lag{LAG_WEEKS}w"
+                 if lag_col in final_df_cropped.columns:
+                     label_base = base_col.replace('_smooth','').replace('_', ' ').title()
+                     metrics_to_test_granger[lag_col] = f"Lag {LAG_WEEKS}w {label_base}"
 
-            for metric_col, metric_label in metrics_to_test_granger.items():
-                # Check if BOTH the target and the metric column exist
-                if target_col_granger in final_df.columns and metric_col in final_df.columns:
+            metrics_to_test_granger_final = {k: v for k, v in metrics_to_test_granger.items() if k in final_df_cropped.columns}
+            logger.info(f"Metrics selected for Granger testing (Cropped): {list(metrics_to_test_granger_final.keys())}")
+
+            for metric_col, metric_label in metrics_to_test_granger_final.items():
+                if target_col_granger in final_df_cropped.columns:
                     logger.info(f"Granger tests: '{metric_col}' vs '{target_col_granger}'")
                     desc1 = f"'{metric_label}' -> 'Log(Deaths)'"
-                    granger_results[desc1] = run_granger_causality(final_df, metric_col, target_col_granger, max_lag=max_weekly_lag)
+                    granger_results[desc1] = run_granger_causality(final_df_cropped, metric_col, target_col_granger, max_lag=max_weekly_lag)
                     desc2 = f"'Log(Deaths)' -> '{metric_label}'"
-                    granger_results[desc2] = run_granger_causality(final_df, target_col_granger, metric_col, max_lag=max_weekly_lag)
-                else:
-                    logger.warning(f"Skipping Granger for '{metric_label}' vs 'Log(Deaths)' - one or both columns missing ({metric_col}, {target_col_granger}).")
+                    granger_results[desc2] = run_granger_causality(final_df_cropped, target_col_granger, metric_col, max_lag=max_weekly_lag)
+                else: logger.warning(f"Target '{target_col_granger}' missing."); break
 
-            # Plot combined results if any tests ran
-            if granger_results:
-                plot_granger_causality_results(granger_results, title_prefix=f"Weekly Combined Metrics vs Log(Deaths+1)", plot_dir=PLOT_DIR)
-            else:
-                logger.warning("No valid Granger results to plot.")
+            if granger_results: plot_granger_causality_results(granger_results, title_prefix=f"Cropped_{ANALYSIS_START_DATE[:4]}_{ANALYSIS_END_DATE[:4]}_Metrics_vs_LogDeaths", plot_dir=PLOT_DIR)
+            else: logger.warning("No valid Granger results to plot for cropped data.")
 
-        else: logger.warning("Final DataFrame empty, skipping interpretation & Granger.")
+        else: logger.warning("Cropped Final DataFrame empty, skipping interpretation & Granger.")
 
-    # --- Error Handling & Finish ---
+    # --- Error Handling & Script End ---
     except FileNotFoundError as e: logger.error(f"Data file not found: {e}.")
     except ValueError as e: logger.error(f"Data processing/config error: {e}", exc_info=True)
     except ImportError as e: logger.error(f"Missing library: {e}.")
@@ -1598,9 +2459,7 @@ def main():
     script_end_time = time.time()
     logger.info(f"--- Script finished in {(script_end_time - script_start_time):.2f} seconds ({(script_end_time - script_start_time)/60:.2f} minutes) ---")
 
-# -----------------------------------------------------------------------------
-# Run Main
-# -----------------------------------------------------------------------------
+# --- Run Main ---
 if __name__ == "__main__":
     pl.seed_everything(42, workers=True)
     main()
