@@ -2044,6 +2044,77 @@ def plot_acf_pacf(series: pd.Series, lags: int, title_prefix: str, filename_suff
          if pacf_fig is not None and plt.fignum_exists(pacf_fig.number): plt.close(pacf_fig)
          plt.close('all')
 
+def plot_lag_scatter(df: pd.DataFrame, target_col: str, predictor_col: str, lag: int,
+                       title: str, filename: str, plot_dir: str):
+    """
+    Plots a scatter plot of the target variable vs. a lagged predictor variable.
+
+    Args:
+        df: DataFrame containing the data.
+        target_col: Name of the target column (e.g., 'log_deaths').
+        predictor_col: Name of the predictor column (e.g., 'hardship_sentiment').
+        lag: The number of time steps (weeks) to lag the predictor.
+        title: Plot title.
+        filename: Name for the saved plot file.
+        plot_dir: Directory to save the plot.
+    """
+    logger.info(f"Generating Lag Scatter plot: {title} (Lag={lag})")
+    if target_col not in df.columns or predictor_col not in df.columns:
+        logger.error(f"Lag Scatter fail '{filename}': Missing columns '{target_col}' or '{predictor_col}'.")
+        return
+    if df.empty:
+        logger.warning(f"DataFrame empty for lag scatter plot '{filename}'. Skipping.")
+        return
+    if lag <= 0:
+        logger.error(f"Lag must be positive for lag scatter plot. Got {lag}. Skipping '{filename}'.")
+        return
+
+    lag_scatter_fig = None # Initialize figure variable
+    try:
+        # Create a temporary DataFrame with the lagged predictor
+        df_lagged = df[[target_col, predictor_col]].copy()
+        lagged_predictor_col_name = f"{predictor_col}_lag{lag}"
+        df_lagged[lagged_predictor_col_name] = df_lagged[predictor_col].shift(lag)
+
+        # Drop NaNs introduced by shifting
+        df_lagged.dropna(subset=[target_col, lagged_predictor_col_name], inplace=True)
+
+        if df_lagged.empty:
+             logger.warning(f"No data remaining after creating lag={lag} for '{predictor_col}'. Skipping scatter plot.")
+             return
+
+        # Create the scatter plot
+        lag_scatter_fig = plt.figure(figsize=(8, 8))
+        sns.scatterplot(data=df_lagged, x=lagged_predictor_col_name, y=target_col,
+                        alpha=0.2, s=10, edgecolor=None) # Same styling as previous scatter
+
+        # Calculate correlation for the title
+        try:
+             # Use numpy for correlation after dropping NaNs
+             correlation = np.corrcoef(df_lagged[target_col], df_lagged[lagged_predictor_col_name])[0, 1]
+             plot_title = f"{title}\n({target_col} vs {predictor_col} at Lag {lag}w)\n(Correlation: {correlation:.2f})"
+        except Exception as corr_err:
+             logger.warning(f"Could not calculate correlation for lag scatter: {corr_err}")
+             plot_title = f"{title}\n({target_col} vs {predictor_col} at Lag {lag}w)"
+
+
+        plt.title(plot_title, fontsize=12) # Smaller fontsize maybe
+        plt.xlabel(f"{predictor_col.replace('_', ' ').title()} (Lag {lag}w)")
+        plt.ylabel(target_col.replace('_', ' ').title())
+        plt.grid(True, linestyle=':', alpha=0.6)
+        plt.tight_layout()
+
+        save_path = os.path.join(plot_dir, filename)
+        plt.savefig(save_path)
+        logger.info(f"Saved lag scatter plot: {save_path}")
+
+    except Exception as e:
+        logger.error(f"Lag Scatter Plot fail '{filename}': {e}", exc_info=True)
+    finally:
+        if lag_scatter_fig is not None and plt.fignum_exists(lag_scatter_fig.number):
+            plt.close(lag_scatter_fig)
+        plt.close('all')
+
 # -----------------------------------------------------------------------------
 # 7. Interpretation & Granger Causality (Unchanged Functions)
 # -----------------------------------------------------------------------------
@@ -2347,9 +2418,36 @@ def main():
             rolling_window_years = 5
             rolling_window_weeks = rolling_window_years * 52
 
+            target_col = 'log_deaths'
+            lag_to_plot = 4 # lag 4 based on CCF/Granger significance
+
+            # Lag Scatter: Hardship Sentiment(t-k) vs LogDeaths(t)
+            if target_col in final_df_cropped.columns and hardship_sent_col in final_df_cropped.columns:
+                plot_lag_scatter(final_df_cropped, target_col, hardship_sent_col, lag=lag_to_plot,
+                                 title=f"Log(Deaths+1) vs Lagged Hardship Sentiment",
+                                 filename=f"lag_scatter_{target_col}_vs_{hardship_sent_col}_lag{lag_to_plot}w.png",
+                                 plot_dir=PLOT_DIR)
+            else:
+                 logger.warning(f"Skipping Lag Scatter: Missing '{hardship_sent_col}' or '{target_col}'.")
+
+            # Lag Scatter: Property Crime Prop Smooth(t-k) vs LogDeaths(t)
+            if prop_crime_smooth and target_col in final_df_cropped.columns and prop_crime_smooth in final_df_cropped.columns:
+                plot_lag_scatter(final_df_cropped, target_col, prop_crime_smooth, lag=lag_to_plot,
+                                 title=f"Log(Deaths+1) vs Lagged Property Crime Prop (Smooth)",
+                                 filename=f"lag_scatter_{target_col}_vs_{prop_crime_smooth}_lag{lag_to_plot}w.png",
+                                 plot_dir=PLOT_DIR)
+            else:
+                 logger.warning(f"Skipping Lag Scatter: Missing '{prop_crime_smooth}' or '{target_col}'.")
+
             # CCF Plots (Example: LogDeaths vs Hardship Sentiment)
             if 'log_deaths' in final_df_cropped.columns and hardship_sent_col in final_df_cropped.columns:
                 plot_ccf(final_df_cropped, 'hardship_sentiment', 'log_deaths', plot_lags,
+                         f"CCF: Hardship Sentiment vs Log(Deaths)",
+                         "ccf_hardship_vs_logdeaths.png", PLOT_DIR)
+                
+                            # CCF Plots (Example: LogDeaths vs Hardship Sentiment)
+            if 'log_deaths' in final_df_cropped.columns and disease_sent_col in final_df_cropped.columns:
+                plot_ccf(final_df_cropped, 'disease_sentiment', 'log_deaths', plot_lags,
                          f"CCF: Hardship Sentiment vs Log(Deaths)",
                          "ccf_hardship_vs_logdeaths.png", PLOT_DIR)
 
